@@ -72,6 +72,22 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply migration to user_version 2")?;
     }
+    if version < 3 {
+        conn.execute_batch(
+            "
+            CREATE TABLE summaries (
+                recording_id TEXT PRIMARY KEY REFERENCES recordings(id),
+                overview TEXT NOT NULL,
+                key_points TEXT NOT NULL,
+                language TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            ALTER TABLE recordings ADD COLUMN summary_language_override TEXT;
+            PRAGMA user_version = 3;
+            ",
+        )
+        .context("failed to apply migration to user_version 3")?;
+    }
     Ok(())
 }
 
@@ -120,6 +136,8 @@ pub enum PipelineStatus {
     Recorded,
     Transcribing,
     Transcribed,
+    Summarizing,
+    Summarized,
     Failed,
 }
 
@@ -129,6 +147,8 @@ impl PipelineStatus {
             PipelineStatus::Recorded => "recorded",
             PipelineStatus::Transcribing => "transcribing",
             PipelineStatus::Transcribed => "transcribed",
+            PipelineStatus::Summarizing => "summarizing",
+            PipelineStatus::Summarized => "summarized",
             PipelineStatus::Failed => "failed",
         }
     }
@@ -138,6 +158,8 @@ impl PipelineStatus {
             "recorded" => PipelineStatus::Recorded,
             "transcribing" => PipelineStatus::Transcribing,
             "transcribed" => PipelineStatus::Transcribed,
+            "summarizing" => PipelineStatus::Summarizing,
+            "summarized" => PipelineStatus::Summarized,
             "failed" => PipelineStatus::Failed,
             other => return Err(anyhow!("unknown recording status {other:?}")),
         })
@@ -185,12 +207,16 @@ pub struct RecordingSummary {
 pub struct JobRow {
     pub id: String,
     pub recording_id: String,
-    // Unused until a second stage (translate/summarize) exists to
-    // distinguish from 'transcribe'; kept now so the jobs table and this
-    // struct don't need a shape change when that lands.
-    #[allow(dead_code)]
     pub stage: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub overview: String,
+    pub key_points: Vec<String>,
+    pub language: String,
 }
 
 fn now() -> String {
@@ -222,6 +248,20 @@ pub fn insert_recording_with_transcribe_job(
     conn.execute(
         "INSERT INTO jobs (id, recording_id, stage, status, error, created_at, updated_at)
          VALUES (?1, ?2, 'transcribe', ?3, NULL, ?4, ?4)",
+        rusqlite::params![job_id, recording_id, JobStatus::Pending.as_str(), created_at],
+    )?;
+    Ok(job_id)
+}
+
+/// Inserts a `summarize` job for a recording whose transcript is already
+/// ready (F3: summary generation is user-triggered, unlike `transcribe`
+/// which is enqueued automatically on `stop_recording`).
+pub fn insert_summarize_job(conn: &Connection, recording_id: &str) -> Result<String> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let created_at = now();
+    conn.execute(
+        "INSERT INTO jobs (id, recording_id, stage, status, error, created_at, updated_at)
+         VALUES (?1, ?2, 'summarize', ?3, NULL, ?4, ?4)",
         rusqlite::params![job_id, recording_id, JobStatus::Pending.as_str(), created_at],
     )?;
     Ok(job_id)
@@ -313,6 +353,34 @@ pub fn get_recording_language_override(
 ) -> Result<Option<String>> {
     conn.query_row(
         "SELECT language_override FROM recordings WHERE id = ?1",
+        [recording_id],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("recording {recording_id} not found"))
+}
+
+/// `None` means "use the transcript's detected language" (F3's default —
+/// summary language independent of, but defaulting to, the transcript
+/// language). Set immediately before enqueueing a `summarize` job, mirroring
+/// how `language_override` is set once at `insert_recording_with_transcribe_job`.
+pub fn set_recording_summary_language_override(
+    conn: &Connection,
+    recording_id: &str,
+    language: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recordings SET summary_language_override = ?1 WHERE id = ?2",
+        rusqlite::params![language, recording_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_recording_summary_language_override(
+    conn: &Connection,
+    recording_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT summary_language_override FROM recordings WHERE id = ?1",
         [recording_id],
         |row| row.get(0),
     )
@@ -415,4 +483,53 @@ pub fn get_transcript_segments(conn: &Connection, recording_id: &str) -> Result<
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Upserts the summary for a recording. Summaries can be regenerated (e.g.
+/// with a different summary language), so this replaces rather than
+/// appends, matching `replace_transcript_segments`'s convention.
+pub fn replace_summary(
+    conn: &Connection,
+    recording_id: &str,
+    summary: &Summary,
+) -> Result<()> {
+    let key_points_json = serde_json::to_string(&summary.key_points)?;
+    conn.execute(
+        "INSERT INTO summaries (recording_id, overview, key_points, language, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(recording_id) DO UPDATE SET
+            overview = excluded.overview,
+            key_points = excluded.key_points,
+            language = excluded.language,
+            created_at = excluded.created_at",
+        rusqlite::params![
+            recording_id,
+            summary.overview,
+            key_points_json,
+            summary.language,
+            now(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_summary(conn: &Connection, recording_id: &str) -> Result<Option<Summary>> {
+    conn.query_row(
+        "SELECT overview, key_points, language FROM summaries WHERE recording_id = ?1",
+        [recording_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(|(overview, key_points_json, language)| {
+        let key_points: Vec<String> = serde_json::from_str(&key_points_json)
+            .context("stored key_points is not valid JSON")?;
+        Ok(Summary { overview, key_points, language })
+    })
+    .transpose()
 }

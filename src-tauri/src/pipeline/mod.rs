@@ -10,7 +10,8 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
 use crate::capture::ffmpeg;
-use crate::db::{self, PipelineStatus, SharedConn};
+use crate::db::{self, PipelineStatus, SharedConn, Summary};
+use crate::llm;
 
 pub type JobSender = mpsc::UnboundedSender<String>;
 
@@ -39,8 +40,8 @@ pub fn spawn_queue_worker(db: SharedConn, app_handle: AppHandle) -> JobSender {
     // context.
     tauri::async_runtime::spawn(async move {
         while let Some(job_id) = rx.recv().await {
-            if let Err(e) = transcribe_one(&db, &app_handle, &job_id).await {
-                tracing::error!("transcription job {job_id} failed: {e:#}");
+            if let Err(e) = process_job(&db, &app_handle, &job_id).await {
+                tracing::error!("job {job_id} failed: {e:#}");
             }
         }
     });
@@ -58,7 +59,11 @@ pub async fn recover_and_enqueue(db: &SharedConn, tx: &JobSender) -> Result<()> 
     Ok(())
 }
 
-async fn transcribe_one(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> Result<()> {
+/// Dispatches a queued job to its stage's handler. Both stages share the
+/// same running/done/failed job bookkeeping and `recording-updated`
+/// emission; only the work in between (and the in-progress/final
+/// `PipelineStatus`) differs per stage.
+async fn process_job(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> Result<()> {
     let job = {
         let job_id = job_id.to_string();
         db::with_db(db, move |conn| db::get_job(conn, &job_id)).await?
@@ -70,32 +75,41 @@ async fn transcribe_one(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -
     }
     let recording_id = job.recording_id.clone();
 
+    let in_progress_status = match job.stage.as_str() {
+        "summarize" => PipelineStatus::Summarizing,
+        _ => PipelineStatus::Transcribing,
+    };
+
     {
         let job_id = job.id.clone();
         db::with_db(db, move |conn| db::set_job_running(conn, &job_id)).await?;
     }
     {
         let rid = recording_id.clone();
-        db::with_db(db, move |conn| {
-            db::set_recording_status(conn, &rid, PipelineStatus::Transcribing)
-        })
-        .await?;
+        db::with_db(db, move |conn| db::set_recording_status(conn, &rid, in_progress_status))
+            .await?;
     }
     emit_update(app_handle, db, &recording_id).await;
 
-    let progress_handle = app_handle.clone();
-    let progress_recording_id = recording_id.clone();
-    let on_progress = move |progress: f64| {
-        let _ = progress_handle.emit(
-            "transcription-progress",
-            TranscriptionProgress {
-                recording_id: progress_recording_id.clone(),
-                progress,
-            },
-        );
+    let result = match job.stage.as_str() {
+        "summarize" => run_summarization(db, &recording_id).await,
+        _ => {
+            let progress_handle = app_handle.clone();
+            let progress_recording_id = recording_id.clone();
+            let on_progress = move |progress: f64| {
+                let _ = progress_handle.emit(
+                    "transcription-progress",
+                    TranscriptionProgress {
+                        recording_id: progress_recording_id.clone(),
+                        progress,
+                    },
+                );
+            };
+            run_transcription(db, &recording_id, on_progress).await
+        }
     };
 
-    match run_transcription(db, &recording_id, on_progress).await {
+    match result {
         Ok(()) => {
             let job_id = job.id.clone();
             db::with_db(db, move |conn| db::set_job_done(conn, &job_id)).await?;
@@ -160,6 +174,75 @@ async fn run_transcription(
         let rid = recording_id.to_string();
         db::with_db(db, move |conn| {
             db::set_recording_status(conn, &rid, PipelineStatus::Transcribed)
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// F3: builds a prompt from the persisted transcript, asks the configured
+/// LLM provider for a JSON summary, and persists the result. Target
+/// language is the user's explicit summary-language override if set,
+/// otherwise the transcript's detected language (spec's language default).
+async fn run_summarization(db: &SharedConn, recording_id: &str) -> Result<()> {
+    let segments = {
+        let rid = recording_id.to_string();
+        db::with_db(db, move |conn| db::get_transcript_segments(conn, &rid)).await?
+    };
+    if segments.is_empty() {
+        return Err(anyhow::anyhow!("no transcript available to summarize"));
+    }
+
+    let detected_language = {
+        let rid = recording_id.to_string();
+        db::with_db(db, move |conn| db::get_recording_summary(conn, &rid))
+            .await?
+            .detected_language
+    };
+    let language_override = {
+        let rid = recording_id.to_string();
+        db::with_db(db, move |conn| {
+            db::get_recording_summary_language_override(conn, &rid)
+        })
+        .await?
+    };
+    let target_language = language_override
+        .or(detected_language)
+        .unwrap_or_else(|| "en".to_string());
+
+    let settings = db::with_db(db, |conn| llm::load_settings(conn)).await?;
+    let cloud_token = llm::read_cloud_token()?;
+
+    let transcript_text: String = segments
+        .iter()
+        .map(|s| s.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let system_prompt = format!(
+        "You summarize meeting/lecture transcripts. Respond ONLY with a JSON \
+         object of the shape {{\"overview\": string, \"key_points\": string[]}} \
+         — a short overview plus a list of key points. Write the summary in \
+         the language with ISO 639-1 code \"{target_language}\", regardless \
+         of the transcript's language."
+    );
+
+    let reply =
+        llm::complete(&settings, cloud_token.as_deref(), &system_prompt, &transcript_text).await?;
+    let parsed = llm::parse_summary_reply(&reply);
+
+    let summary = Summary {
+        overview: parsed.overview,
+        key_points: parsed.key_points,
+        language: target_language,
+    };
+    {
+        let rid = recording_id.to_string();
+        db::with_db(db, move |conn| db::replace_summary(conn, &rid, &summary)).await?;
+    }
+    {
+        let rid = recording_id.to_string();
+        db::with_db(db, move |conn| {
+            db::set_recording_status(conn, &rid, PipelineStatus::Summarized)
         })
         .await?;
     }
@@ -232,5 +315,98 @@ mod tests {
         .await
         .unwrap();
         assert!(!segments.is_empty(), "expected persisted transcript segments");
+    }
+
+    /// Real DB + real HTTP round trip against a local `wiremock` server
+    /// standing in for an OpenAI-compatible local LLM endpoint (a real
+    /// external LLM isn't available in CI, so only that boundary is faked —
+    /// everything else, including JSON parsing and persistence, is real).
+    /// Asserts F3's Given/When/Then: a ready transcript plus a configured
+    /// provider yields a persisted overview + key points and status
+    /// "summarized".
+    #[tokio::test]
+    async fn run_summarization_persists_summary_and_status() {
+        let base_dir = std::env::temp_dir().join("screen_recorder_summarize_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let db = db::open(&base_dir.join("db.sqlite3")).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content":
+                    "{\"overview\": \"a test overview\", \"key_points\": [\"point one\"]}"
+                }}]
+            })))
+            .mount(&server)
+            .await;
+
+        let recording_id = uuid::Uuid::new_v4().to_string();
+        let video_path = base_dir.join("fake_recording.mp4");
+        {
+            let rid = recording_id.clone();
+            let vp = video_path.clone();
+            db::with_db(&db, move |conn| {
+                db::insert_recording_with_transcribe_job(conn, &rid, &vp, None)
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| {
+                db::replace_transcript_segments(
+                    conn,
+                    &rid,
+                    &[db::Segment { start_ms: 0, end_ms: 1000, text: "hello world".to_string() }],
+                )
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| db::set_recording_detected_language(conn, &rid, "en"))
+                .await
+                .unwrap();
+        }
+        {
+            let server_uri = server.uri();
+            db::with_db(&db, move |conn| {
+                let settings = llm::LlmSettings {
+                    provider: llm::ProviderKind::Local,
+                    local_base_url: server_uri,
+                    local_model: "test-model".to_string(),
+                    ..llm::LlmSettings::default()
+                };
+                llm::save_settings(conn, &settings)
+            })
+            .await
+            .unwrap();
+        }
+
+        run_summarization(&db, &recording_id)
+            .await
+            .expect("summarization should succeed");
+
+        let recording_summary = {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| db::get_recording_summary(conn, &rid))
+                .await
+                .unwrap()
+        };
+        assert_eq!(recording_summary.status, PipelineStatus::Summarized);
+
+        let summary = {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| db::get_summary(conn, &rid))
+                .await
+                .unwrap()
+        }
+        .expect("summary should be persisted");
+        assert_eq!(summary.overview, "a test overview");
+        assert_eq!(summary.key_points, vec!["point one".to_string()]);
+        assert_eq!(summary.language, "en");
     }
 }

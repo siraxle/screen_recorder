@@ -1,6 +1,7 @@
 mod capture;
 mod commands;
 mod db;
+mod llm;
 mod pipeline;
 mod state;
 mod subtitle;
@@ -64,6 +65,13 @@ pub fn run() {
             commands::get_recordings_dir,
             commands::set_recordings_dir,
             commands::pick_recordings_dir,
+            commands::get_llm_settings,
+            commands::set_llm_settings,
+            commands::set_cloud_api_token,
+            commands::clear_cloud_api_token,
+            commands::check_local_llm_connection,
+            commands::generate_summary,
+            commands::get_summary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

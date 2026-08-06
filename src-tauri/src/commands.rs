@@ -5,7 +5,8 @@ use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
-use crate::db::{self, RecordingSummary, Segment};
+use crate::db::{self, RecordingSummary, Segment, Summary};
+use crate::llm::{self, LlmSettings, ProviderKind};
 use crate::state::AppState;
 use crate::subtitle;
 
@@ -218,4 +219,121 @@ pub async fn export_subtitles(
     let output_path = video_path.with_extension(&format);
     std::fs::write(&output_path, contents).map_err(|e| e.to_string())?;
     Ok(output_path.to_string_lossy().to_string())
+}
+
+/// `get_llm_settings`'s response: provider config plus whether a cloud token
+/// is saved (never the token itself — see `llm::read_cloud_token`'s doc
+/// comment on why it never leaves the keychain except for a single request).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSettingsResponse {
+    #[serde(flatten)]
+    pub settings: LlmSettings,
+    pub cloud_token_configured: bool,
+}
+
+#[tauri::command]
+pub async fn get_llm_settings(state: State<'_, AppState>) -> Result<LlmSettingsResponse, String> {
+    let settings = db::with_db(&state.db, |conn| llm::load_settings(conn))
+        .await
+        .map_err(|e| e.to_string())?;
+    let cloud_token_configured = llm::read_cloud_token()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    Ok(LlmSettingsResponse { settings, cloud_token_configured })
+}
+
+#[tauri::command]
+pub async fn set_llm_settings(
+    state: State<'_, AppState>,
+    settings: LlmSettings,
+) -> Result<(), String> {
+    db::with_db(&state.db, move |conn| llm::save_settings(conn, &settings))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_cloud_api_token(token: String) -> Result<(), String> {
+    llm::write_cloud_token(&token).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_cloud_api_token() -> Result<(), String> {
+    llm::clear_cloud_token().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn check_local_llm_connection(base_url: String) -> Result<(), String> {
+    llm::check_connection(&base_url).await.map_err(|e| e.to_string())
+}
+
+/// Validates that a transcript and a usable provider both exist, then
+/// enqueues a `summarize` job. Validation happens *before* touching the
+/// queue so an unconfigured/invalid provider produces a clear error without
+/// any transcript data ever being sent anywhere (F3's Given/When/Then for a
+/// missing/invalid cloud token).
+#[tauri::command]
+pub async fn generate_summary(
+    state: State<'_, AppState>,
+    recording_id: String,
+    summary_language: Option<String>,
+) -> Result<(), String> {
+    let segments = {
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::get_transcript_segments(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if segments.is_empty() {
+        return Err("no transcript available for this recording yet".to_string());
+    }
+
+    let settings = db::with_db(&state.db, |conn| llm::load_settings(conn))
+        .await
+        .map_err(|e| e.to_string())?;
+    match settings.provider {
+        ProviderKind::Cloud => {
+            let has_token = llm::read_cloud_token()
+                .map_err(|e| e.to_string())?
+                .is_some();
+            if !has_token {
+                return Err("cloud provider selected but no API token is configured".to_string());
+            }
+        }
+        ProviderKind::Local => {
+            if settings.local_base_url.trim().is_empty() {
+                return Err("local provider base URL is not configured".to_string());
+            }
+        }
+    }
+
+    {
+        let rid = recording_id.clone();
+        let lang = summary_language.clone();
+        db::with_db(&state.db, move |conn| {
+            db::set_recording_summary_language_override(conn, &rid, lang.as_deref())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    let job_id = {
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::insert_summarize_job(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let _ = state.job_tx.send(job_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_summary(
+    state: State<'_, AppState>,
+    recording_id: String,
+) -> Result<Option<Summary>, String> {
+    db::with_db(&state.db, move |conn| db::get_summary(conn, &recording_id))
+        .await
+        .map_err(|e| e.to_string())
 }
