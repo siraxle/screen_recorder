@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub type SharedConn = Arc<Mutex<Connection>>;
@@ -60,6 +60,39 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply migration to user_version 1")?;
     }
+    if version < 2 {
+        conn.execute_batch(
+            "
+            CREATE TABLE settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            PRAGMA user_version = 2;
+            ",
+        )
+        .context("failed to apply migration to user_version 2")?;
+    }
+    Ok(())
+}
+
+/// Key-value store for user preferences (e.g. the chosen recordings folder,
+/// see F1 "let the user choose where recordings are saved"). Deliberately
+/// generic rather than a dedicated `recordings_dir` column, since this is
+/// the natural place for future single-value settings too.
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
     Ok(())
 }
 

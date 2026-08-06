@@ -5,6 +5,7 @@
 pub mod stt;
 
 use anyhow::Result;
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
@@ -12,6 +13,19 @@ use crate::capture::ffmpeg;
 use crate::db::{self, PipelineStatus, SharedConn};
 
 pub type JobSender = mpsc::UnboundedSender<String>;
+
+/// Payload for the `transcription-progress` event, emitted as
+/// `pipeline::stt::transcribe` reports progress fractions. Pushed
+/// independently of `recording-updated` (which only fires on stage
+/// transitions) since progress changes far more often than the DB-backed
+/// summary needs to be re-read for.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptionProgress {
+    recording_id: String,
+    /// 0.0..=1.0
+    progress: f64,
+}
 
 /// Spawns the single background worker that drains the job queue. One
 /// worker, sequential processing: there is one GPU and one model instance,
@@ -69,7 +83,19 @@ async fn transcribe_one(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -
     }
     emit_update(app_handle, db, &recording_id).await;
 
-    match run_transcription(db, &recording_id).await {
+    let progress_handle = app_handle.clone();
+    let progress_recording_id = recording_id.clone();
+    let on_progress = move |progress: f64| {
+        let _ = progress_handle.emit(
+            "transcription-progress",
+            TranscriptionProgress {
+                recording_id: progress_recording_id.clone(),
+                progress,
+            },
+        );
+    };
+
+    match run_transcription(db, &recording_id, on_progress).await {
         Ok(()) => {
             let job_id = job.id.clone();
             db::with_db(db, move |conn| db::set_job_done(conn, &job_id)).await?;
@@ -89,7 +115,11 @@ async fn transcribe_one(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -
     Ok(())
 }
 
-async fn run_transcription(db: &SharedConn, recording_id: &str) -> Result<()> {
+async fn run_transcription(
+    db: &SharedConn,
+    recording_id: &str,
+    on_progress: impl Fn(f64) + Send + 'static,
+) -> Result<()> {
     let video_path = {
         let rid = recording_id.to_string();
         db::with_db(db, move |conn| db::get_recording_video_path(conn, &rid)).await?
@@ -106,7 +136,7 @@ async fn run_transcription(db: &SharedConn, recording_id: &str) -> Result<()> {
     )
     .await?;
 
-    let result = stt::transcribe(&wav_path, language_override.as_deref()).await;
+    let result = stt::transcribe(&wav_path, language_override.as_deref(), on_progress).await;
     let _ = std::fs::remove_file(&wav_path);
     let result = result?;
 
@@ -183,7 +213,7 @@ mod tests {
             .unwrap();
         }
 
-        run_transcription(&db, &recording_id)
+        run_transcription(&db, &recording_id, |_| {})
             .await
             .expect("pipeline should succeed");
 

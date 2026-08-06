@@ -1,12 +1,14 @@
 """Batch transcription worker, invoked as a subprocess by the Rust pipeline
 (see src-tauri/src/pipeline/stt.rs).
 
-Contract: takes a path to a normalized WAV file, prints exactly one JSON
-object to stdout on success and exits 0; on failure, prints a traceback to
-stderr and exits non-zero. This is the swappable boundary CLAUDE.md calls
-for between the Rust orchestrator and the STT runtime (faster-whisper here,
-whisper.cpp elsewhere) -- it never touches ffmpeg or the mp4 container
-itself.
+Contract: takes a path to a normalized WAV file and prints newline-delimited
+JSON objects to stdout: zero or more `{"type": "progress", ...}` lines as
+segments are produced, followed by exactly one `{"type": "result", ...}`
+line on success, then exits 0. On failure, prints a traceback to stderr and
+exits non-zero (no result line is written). This is the swappable boundary
+CLAUDE.md calls for between the Rust orchestrator and the STT runtime
+(faster-whisper here, whisper.cpp elsewhere) -- it never touches ffmpeg or
+the mp4 container itself.
 """
 
 import argparse
@@ -60,17 +62,41 @@ def main() -> None:
         vad_filter=True,
     )
 
-    segments = [
-        {"start": segment.start, "end": segment.end, "text": segment.text.strip()}
-        for segment in segments_iter
-    ]
+    # `info.duration` (from the initial VAD/decode pass) is known before the
+    # segment generator is consumed, so it's a stable denominator for
+    # progress -- segments are then streamed and reported as they land,
+    # since faster-whisper only yields them once each is fully decoded.
+    duration = info.duration
+    segments = []
+    for segment in segments_iter:
+        segments.append(
+            {"start": segment.start, "end": segment.end, "text": segment.text.strip()}
+        )
+        if duration > 0:
+            _emit(
+                {
+                    "type": "progress",
+                    "processed_seconds": min(segment.end, duration),
+                    "duration_seconds": duration,
+                }
+            )
 
     result = {
+        "type": "result",
         "language": info.language,
         "language_probability": info.language_probability,
         "segments": segments,
     }
-    json.dump(result, sys.stdout)
+    _emit(result)
+
+
+def _emit(obj: dict) -> None:
+    """Writes one JSON object as a line and flushes immediately, so the Rust
+    side can react to progress lines as they arrive instead of only after
+    the whole subprocess exits."""
+    json.dump(obj, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

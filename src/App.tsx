@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
@@ -24,6 +24,11 @@ interface RecordingSummary {
 interface StopRecordingResult {
   recordingId: string;
   videoPath: string;
+}
+
+interface TranscriptionProgress {
+  recordingId: string;
+  progress: number; // 0.0..=1.0
 }
 
 const LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
@@ -55,7 +60,9 @@ function App() {
   const [busy, setBusy] = useState(false);
 
   const [pipeline, setPipeline] = useState<RecordingSummary | null>(null);
+  const [transcriptionProgress, setTranscriptionProgress] = useState<number | null>(null);
   const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [recordingsDir, setRecordingsDir] = useState<string>("");
   const recordingIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -68,9 +75,27 @@ function App() {
   }, []);
 
   useEffect(() => {
+    invoke<string>("get_recordings_dir")
+      .then(setRecordingsDir)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
     const unlisten = listen<RecordingSummary>("recording-updated", (event) => {
       if (event.payload.id === recordingIdRef.current) {
         setPipeline(event.payload);
+        setTranscriptionProgress(event.payload.status === "transcribing" ? 0 : null);
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<TranscriptionProgress>("transcription-progress", (event) => {
+      if (event.payload.recordingId === recordingIdRef.current) {
+        setTranscriptionProgress(event.payload.progress);
       }
     });
     return () => {
@@ -99,6 +124,7 @@ function App() {
 
   async function handleStart() {
     setPipeline(null);
+    setTranscriptionProgress(null);
     setExportedPath(null);
     recordingIdRef.current = null;
     const config: CaptureConfig = {
@@ -137,7 +163,15 @@ function App() {
         status: "recorded",
         detectedLanguage: null,
       });
+      setTranscriptionProgress(null);
     }
+  }
+
+  async function handleChangeRecordingsDir() {
+    const chosen = await run(() => invoke<string | null>("pick_recordings_dir"));
+    if (!chosen) return;
+    await run(() => invoke("set_recordings_dir", { path: chosen }));
+    setRecordingsDir(chosen);
   }
 
   async function handleExport(format: "srt" | "vtt") {
@@ -155,6 +189,16 @@ function App() {
         Week 2 milestone: batch transcription via faster-whisper (Whisper
         small, CUDA), SRT/VTT export.
       </p>
+
+      <section className="panel">
+        <label className="checkbox-row path-row">
+          Save recordings to
+          <code className="path-value">{recordingsDir || "…"}</code>
+        </label>
+        <button disabled={busy || status !== "stopped"} onClick={handleChangeRecordingsDir}>
+          Change folder…
+        </button>
+      </section>
 
       <section className="panel">
         <label className="checkbox-row">
@@ -256,6 +300,21 @@ function App() {
             Transcription: <strong>{PIPELINE_LABEL[pipeline.status]}</strong>
             {pipeline.detectedLanguage && ` (${pipeline.detectedLanguage})`}
           </p>
+          {pipeline.status === "transcribing" && (
+            <div className="progress-bar">
+              <div
+                className="progress-bar-fill"
+                role="progressbar"
+                aria-valuenow={Math.round((transcriptionProgress ?? 0) * 100)}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                style={{ "--progress": `${Math.round((transcriptionProgress ?? 0) * 100)}%` } as CSSProperties}
+              />
+              <span className="progress-bar-label">
+                {Math.round((transcriptionProgress ?? 0) * 100)}%
+              </span>
+            </div>
+          )}
           <p className="output">
             <code>{pipeline.videoPath}</code>
           </p>
