@@ -213,10 +213,14 @@ pub async fn complete(
         .error_for_status()
         .context("LLM provider returned an error status")?;
 
-    let parsed: ChatResponse = response
-        .json()
+    let body = response
+        .text()
         .await
-        .context("failed to parse LLM provider response")?;
+        .context("failed to read LLM provider response body")?;
+    let parsed: ChatResponse = serde_json::from_str(&body).with_context(|| {
+        let snippet: String = body.chars().take(200).collect();
+        format!("failed to parse LLM provider response: {snippet}")
+    })?;
     let content = parsed
         .choices
         .into_iter()
