@@ -188,6 +188,30 @@ pub fn write_concat_list(segment_paths: &[std::path::PathBuf], list_path: &Path)
     Ok(())
 }
 
+/// Extracts a normalized 16kHz mono WAV from a finished recording, for
+/// handing to the STT worker (see `pipeline/stt.rs`). Every Whisper runtime
+/// CLAUDE.md lists (faster-whisper here, whisper.cpp on other platforms)
+/// takes a plain audio file, so the worker boundary stays swappable instead
+/// of depending on a particular runtime's own container-decoding path.
+pub fn build_wav_extract_command(video_path: &Path, wav_path: &Path) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(video_path)
+        .arg("-vn")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-ac")
+        .arg("1")
+        .arg("-c:a")
+        .arg("pcm_s16le")
+        .arg(wav_path);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Enumerates dshow audio input device names (microphones) by parsing
 /// ffmpeg's `-list_devices` stderr output. Used to populate the microphone
 /// picker instead of hardcoding a device name.

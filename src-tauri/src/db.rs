@@ -1,0 +1,385 @@
+//! SQLite persistence for the transcription job queue (F2).
+//!
+//! Schema is versioned via `PRAGMA user_version` so future stages
+//! (translate/summarize/index, see CLAUDE.md's job queue convention) can add
+//! tables/columns without a migration framework. `recordings.status` is a
+//! denormalized read for the UI; `jobs` (keyed by `stage`) is the source of
+//! truth the queue and crash recovery drive off, since a later stage
+//! (`translating`) must be able to run concurrently with another
+//! (`summarizing`) — something a single status column on `recordings` can't
+//! represent.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Context, Result};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+
+pub type SharedConn = Arc<Mutex<Connection>>;
+
+pub fn open(path: &Path) -> Result<SharedConn> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("failed to open sqlite db at {path:?}"))?;
+    run_migrations(&conn)?;
+    Ok(Arc::new(Mutex::new(conn)))
+}
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 1 {
+        conn.execute_batch(
+            "
+            CREATE TABLE recordings (
+                id TEXT PRIMARY KEY,
+                video_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                language_override TEXT,
+                detected_language TEXT
+            );
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                recording_id TEXT NOT NULL REFERENCES recordings(id),
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE transcript_segments (
+                recording_id TEXT NOT NULL REFERENCES recordings(id),
+                segment_index INTEGER NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                PRIMARY KEY (recording_id, segment_index)
+            );
+            PRAGMA user_version = 1;
+            ",
+        )
+        .context("failed to apply migration to user_version 1")?;
+    }
+    Ok(())
+}
+
+/// Runs a blocking rusqlite closure off the async runtime's worker pool.
+/// Every DB access in this app goes through here rather than an async
+/// driver: this is a small local-only app with a single writer, so a
+/// pooled/async SQLite layer would add complexity without buying anything.
+pub async fn with_db<F, T>(db: &SharedConn, f: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let db = Arc::clone(db);
+    tokio::task::spawn_blocking(move || {
+        let conn = db.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        f(&conn)
+    })
+    .await
+    .context("db task panicked")?
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStatus {
+    Recorded,
+    Transcribing,
+    Transcribed,
+    Failed,
+}
+
+impl PipelineStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            PipelineStatus::Recorded => "recorded",
+            PipelineStatus::Transcribing => "transcribing",
+            PipelineStatus::Transcribed => "transcribed",
+            PipelineStatus::Failed => "failed",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "recorded" => PipelineStatus::Recorded,
+            "transcribing" => PipelineStatus::Transcribing,
+            "transcribed" => PipelineStatus::Transcribed,
+            "failed" => PipelineStatus::Failed,
+            other => return Err(anyhow!("unknown recording status {other:?}")),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+impl JobStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Pending => "pending",
+            JobStatus::Running => "running",
+            JobStatus::Done => "done",
+            JobStatus::Failed => "failed",
+        }
+    }
+}
+
+/// One transcript utterance, shared between the STT worker's parsed output,
+/// DB storage, and subtitle formatting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Segment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSummary {
+    pub id: String,
+    pub video_path: String,
+    pub created_at: String,
+    pub status: PipelineStatus,
+    pub detected_language: Option<String>,
+}
+
+pub struct JobRow {
+    pub id: String,
+    pub recording_id: String,
+    // Unused until a second stage (translate/summarize) exists to
+    // distinguish from 'transcribe'; kept now so the jobs table and this
+    // struct don't need a shape change when that lands.
+    #[allow(dead_code)]
+    pub stage: String,
+    pub status: String,
+}
+
+fn now() -> String {
+    chrono::Local::now().to_rfc3339()
+}
+
+/// Inserts the `recordings` row and its `transcribe` job in one go — a
+/// recording is never persisted without a job to process it.
+pub fn insert_recording_with_transcribe_job(
+    conn: &Connection,
+    recording_id: &str,
+    video_path: &Path,
+    language_override: Option<&str>,
+) -> Result<String> {
+    let created_at = now();
+    conn.execute(
+        "INSERT INTO recordings (id, video_path, created_at, status, language_override, detected_language)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        rusqlite::params![
+            recording_id,
+            video_path.to_string_lossy(),
+            created_at,
+            PipelineStatus::Recorded.as_str(),
+            language_override,
+        ],
+    )?;
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO jobs (id, recording_id, stage, status, error, created_at, updated_at)
+         VALUES (?1, ?2, 'transcribe', ?3, NULL, ?4, ?4)",
+        rusqlite::params![job_id, recording_id, JobStatus::Pending.as_str(), created_at],
+    )?;
+    Ok(job_id)
+}
+
+/// Resets any job left `running` by a previous crashed run back to
+/// `pending` (transcription is all-or-nothing, so re-running from `pending`
+/// is the correct resume point), then returns every pending job id so the
+/// caller can re-enqueue them.
+pub fn recover_pending_job_ids(conn: &Connection) -> Result<Vec<String>> {
+    conn.execute(
+        "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE status = ?3",
+        rusqlite::params![JobStatus::Pending.as_str(), now(), JobStatus::Running.as_str()],
+    )?;
+    let mut stmt = conn.prepare("SELECT id FROM jobs WHERE status = ?1")?;
+    let ids = stmt
+        .query_map([JobStatus::Pending.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+pub fn get_job(conn: &Connection, job_id: &str) -> Result<JobRow> {
+    conn.query_row(
+        "SELECT id, recording_id, stage, status FROM jobs WHERE id = ?1",
+        [job_id],
+        |row| {
+            Ok(JobRow {
+                id: row.get(0)?,
+                recording_id: row.get(1)?,
+                stage: row.get(2)?,
+                status: row.get(3)?,
+            })
+        },
+    )
+    .with_context(|| format!("job {job_id} not found"))
+}
+
+pub fn set_job_running(conn: &Connection, job_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![JobStatus::Running.as_str(), now(), job_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_job_done(conn: &Connection, job_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET status = ?1, error = NULL, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![JobStatus::Done.as_str(), now(), job_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_job_failed(conn: &Connection, job_id: &str, error: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+        rusqlite::params![JobStatus::Failed.as_str(), error, now(), job_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_recording_status(
+    conn: &Connection,
+    recording_id: &str,
+    status: PipelineStatus,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recordings SET status = ?1 WHERE id = ?2",
+        rusqlite::params![status.as_str(), recording_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_recording_detected_language(
+    conn: &Connection,
+    recording_id: &str,
+    language: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recordings SET detected_language = ?1 WHERE id = ?2",
+        rusqlite::params![language, recording_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_recording_language_override(
+    conn: &Connection,
+    recording_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT language_override FROM recordings WHERE id = ?1",
+        [recording_id],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("recording {recording_id} not found"))
+}
+
+pub fn get_recording_video_path(conn: &Connection, recording_id: &str) -> Result<PathBuf> {
+    let path: String = conn
+        .query_row(
+            "SELECT video_path FROM recordings WHERE id = ?1",
+            [recording_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("recording {recording_id} not found"))?;
+    Ok(PathBuf::from(path))
+}
+
+pub fn get_recording_summary(conn: &Connection, recording_id: &str) -> Result<RecordingSummary> {
+    conn.query_row(
+        "SELECT id, video_path, created_at, status, detected_language FROM recordings WHERE id = ?1",
+        [recording_id],
+        |row| {
+            let status: String = row.get(3)?;
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, status, row.get::<_, Option<String>>(4)?))
+        },
+    )
+    .with_context(|| format!("recording {recording_id} not found"))
+    .and_then(|(id, video_path, created_at, status, detected_language)| {
+        Ok(RecordingSummary {
+            id,
+            video_path,
+            created_at,
+            status: PipelineStatus::parse(&status)?,
+            detected_language,
+        })
+    })
+}
+
+pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, video_path, created_at, status, detected_language
+         FROM recordings ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    rows.into_iter()
+        .map(|(id, video_path, created_at, status, detected_language)| {
+            Ok(RecordingSummary {
+                id,
+                video_path,
+                created_at,
+                status: PipelineStatus::parse(&status)?,
+                detected_language,
+            })
+        })
+        .collect()
+}
+
+pub fn replace_transcript_segments(
+    conn: &Connection,
+    recording_id: &str,
+    segments: &[Segment],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM transcript_segments WHERE recording_id = ?1",
+        [recording_id],
+    )?;
+    for (index, segment) in segments.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO transcript_segments (recording_id, segment_index, start_ms, end_ms, text)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![recording_id, index as i64, segment.start_ms, segment.end_ms, segment.text],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn get_transcript_segments(conn: &Connection, recording_id: &str) -> Result<Vec<Segment>> {
+    let mut stmt = conn.prepare(
+        "SELECT start_ms, end_ms, text FROM transcript_segments
+         WHERE recording_id = ?1 ORDER BY segment_index ASC",
+    )?;
+    let rows = stmt
+        .query_map([recording_id], |row| {
+            Ok(Segment {
+                start_ms: row.get(0)?,
+                end_ms: row.get(1)?,
+                text: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}

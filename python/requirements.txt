@@ -1,0 +1,9 @@
+faster-whisper>=1.2
+
+# ctranslate2's GPU wheel links against the CUDA 12 cuBLAS/cuDNN runtime.
+# These packages vendor that exact runtime as DLLs/shared libs, so a system
+# CUDA 12 install isn't required even on machines (like this one) that only
+# have a newer CUDA toolkit installed. See whisper_worker.py's
+# _register_cuda_dll_dirs for how they're located at runtime.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

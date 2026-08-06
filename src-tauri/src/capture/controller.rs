@@ -37,10 +37,18 @@ pub struct CaptureController {
     finalized_segments: Vec<PathBuf>,
     active: Option<ActiveSegment>,
     status: RecordingStatus,
+    /// Transcription-language override for this recording, carried through
+    /// from `start` to `stop` so it can be persisted alongside the finished
+    /// recording (see `commands::stop_recording`). `None` means auto-detect.
+    language_override: Option<String>,
 }
 
 impl CaptureController {
-    pub fn new(config: CaptureConfig, base_dir: &Path) -> Result<Self> {
+    pub fn new(
+        config: CaptureConfig,
+        base_dir: &Path,
+        language_override: Option<String>,
+    ) -> Result<Self> {
         let work_dir = base_dir.join(format!("recording-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&work_dir)
             .with_context(|| format!("failed to create working dir {work_dir:?}"))?;
@@ -51,11 +59,16 @@ impl CaptureController {
             finalized_segments: Vec::new(),
             active: None,
             status: RecordingStatus::Stopped,
+            language_override,
         })
     }
 
     pub fn status(&self) -> RecordingStatus {
         self.status
+    }
+
+    pub fn language_override(&self) -> Option<&str> {
+        self.language_override.as_deref()
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -229,7 +242,7 @@ mod tests {
             microphone_device: None,
             framerate: 10,
         };
-        let mut controller = CaptureController::new(config, &base_dir).unwrap();
+        let mut controller = CaptureController::new(config, &base_dir, None).unwrap();
 
         controller.start().await.expect("start should succeed");
         assert_eq!(controller.status(), RecordingStatus::Recording);

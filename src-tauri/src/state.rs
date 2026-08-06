@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 use crate::capture::CaptureController;
+use crate::db::SharedConn;
+use crate::pipeline::JobSender;
 
 /// Recording state is a single optional controller: this prototype supports
 /// one active recording at a time, matching the F1 acceptance criteria
@@ -10,4 +12,6 @@ use crate::capture::CaptureController;
 pub struct AppState {
     pub controller: Mutex<Option<CaptureController>>,
     pub recordings_dir: PathBuf,
+    pub db: SharedConn,
+    pub job_tx: JobSender,
 }
