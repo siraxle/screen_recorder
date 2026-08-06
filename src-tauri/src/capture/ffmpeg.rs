@@ -212,6 +212,38 @@ pub fn build_wav_extract_command(video_path: &Path, wav_path: &Path) -> Command 
     cmd
 }
 
+/// Reads the finished recording's actual media duration via `ffprobe`
+/// (rather than tracking wall-clock time across pause/resume segments in the
+/// controller), so it reflects the real duration of the concatenated output
+/// file. Used to populate the recordings library (F5).
+pub async fn probe_duration_ms(video_path: &Path) -> Result<i64> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(video_path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to spawn ffprobe")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ffprobe exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let seconds: f64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .with_context(|| format!("failed to parse ffprobe duration output for {video_path:?}"))?;
+    Ok((seconds * 1000.0).round() as i64)
+}
+
 /// Enumerates dshow audio input device names (microphones) by parsing
 /// ffmpeg's `-list_devices` stderr output. Used to populate the microphone
 /// picker instead of hardcoding a device name.

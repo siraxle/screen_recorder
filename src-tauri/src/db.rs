@@ -107,6 +107,15 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("PRAGMA user_version = 4;")
             .context("failed to apply migration to user_version 4")?;
     }
+    if version < 5 {
+        conn.execute_batch(
+            "
+            ALTER TABLE recordings ADD COLUMN duration_ms INTEGER;
+            PRAGMA user_version = 5;
+            ",
+        )
+        .context("failed to apply migration to user_version 5")?;
+    }
     Ok(())
 }
 
@@ -221,6 +230,7 @@ pub struct RecordingSummary {
     pub created_at: String,
     pub status: PipelineStatus,
     pub detected_language: Option<String>,
+    pub duration_ms: Option<i64>,
 }
 
 pub struct JobRow {
@@ -249,17 +259,19 @@ pub fn insert_recording_with_transcribe_job(
     recording_id: &str,
     video_path: &Path,
     language_override: Option<&str>,
+    duration_ms: Option<i64>,
 ) -> Result<String> {
     let created_at = now();
     conn.execute(
-        "INSERT INTO recordings (id, video_path, created_at, status, language_override, detected_language)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        "INSERT INTO recordings (id, video_path, created_at, status, language_override, detected_language, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
         rusqlite::params![
             recording_id,
             video_path.to_string_lossy(),
             created_at,
             PipelineStatus::Recorded.as_str(),
             language_override,
+            duration_ms,
         ],
     )?;
 
@@ -419,28 +431,29 @@ pub fn get_recording_video_path(conn: &Connection, recording_id: &str) -> Result
 
 pub fn get_recording_summary(conn: &Connection, recording_id: &str) -> Result<RecordingSummary> {
     conn.query_row(
-        "SELECT id, video_path, created_at, status, detected_language FROM recordings WHERE id = ?1",
+        "SELECT id, video_path, created_at, status, detected_language, duration_ms FROM recordings WHERE id = ?1",
         [recording_id],
         |row| {
             let status: String = row.get(3)?;
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, status, row.get::<_, Option<String>>(4)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, status, row.get::<_, Option<String>>(4)?, row.get::<_, Option<i64>>(5)?))
         },
     )
     .with_context(|| format!("recording {recording_id} not found"))
-    .and_then(|(id, video_path, created_at, status, detected_language)| {
+    .and_then(|(id, video_path, created_at, status, detected_language, duration_ms)| {
         Ok(RecordingSummary {
             id,
             video_path,
             created_at,
             status: PipelineStatus::parse(&status)?,
             detected_language,
+            duration_ms,
         })
     })
 }
 
 pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT id, video_path, created_at, status, detected_language
+        "SELECT id, video_path, created_at, status, detected_language, duration_ms
          FROM recordings ORDER BY created_at DESC",
     )?;
     let rows = stmt
@@ -451,18 +464,20 @@ pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     rows.into_iter()
-        .map(|(id, video_path, created_at, status, detected_language)| {
+        .map(|(id, video_path, created_at, status, detected_language, duration_ms)| {
             Ok(RecordingSummary {
                 id,
                 video_path,
                 created_at,
                 status: PipelineStatus::parse(&status)?,
                 detected_language,
+                duration_ms,
             })
         })
         .collect()

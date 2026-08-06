@@ -45,6 +45,7 @@ interface RecordingSummary {
   createdAt: string;
   status: PipelineStatus;
   detectedLanguage: string | null;
+  durationMs: number | null;
 }
 
 interface StopRecordingResult {
@@ -55,6 +56,12 @@ interface StopRecordingResult {
 interface TranscriptionProgress {
   recordingId: string;
   progress: number; // 0.0..=1.0
+}
+
+interface JobFailed {
+  recordingId: string;
+  stage: string;
+  message: string;
 }
 
 const LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
@@ -76,6 +83,25 @@ const PIPELINE_LABEL: Record<PipelineStatus, string> = {
   failed: "Processing failed",
 };
 
+function formatDuration(durationMs: number | null): string {
+  if (durationMs == null) return "—";
+  const totalSeconds = Math.round(durationMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return hours > 0
+    ? `${hours}:${pad(minutes)}:${pad(seconds)}`
+    : `${minutes}:${pad(seconds)}`;
+}
+
+function formatCreatedAt(createdAt: string): string {
+  if (!createdAt) return "—";
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return createdAt;
+  return date.toLocaleString();
+}
+
 const DEFAULT_LLM_SETTINGS: LlmSettingsResponse = {
   provider: "local",
   localBaseUrl: "",
@@ -96,6 +122,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [pipeline, setPipeline] = useState<RecordingSummary | null>(null);
   const [transcriptionProgress, setTranscriptionProgress] = useState<number | null>(null);
   const [exportedPath, setExportedPath] = useState<string | null>(null);
@@ -132,6 +159,16 @@ function App() {
       .catch((e) => setError(String(e)));
   }, []);
 
+  function refreshRecordings() {
+    invoke<RecordingSummary[]>("list_recordings")
+      .then(setRecordings)
+      .catch((e) => setError(String(e)));
+  }
+
+  useEffect(() => {
+    refreshRecordings();
+  }, []);
+
   useEffect(() => {
     if (pipeline?.status !== "summarized" || !recordingIdRef.current) return;
     invoke<Summary | null>("get_summary", { recordingId: recordingIdRef.current })
@@ -145,6 +182,12 @@ function App() {
         setPipeline(event.payload);
         setTranscriptionProgress(event.payload.status === "transcribing" ? 0 : null);
       }
+      setRecordings((prev) => {
+        const next = prev.filter((r) => r.id !== event.payload.id);
+        next.unshift(event.payload);
+        next.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        return next;
+      });
     });
     return () => {
       unlisten.then((f) => f());
@@ -155,6 +198,17 @@ function App() {
     const unlisten = listen<TranscriptionProgress>("transcription-progress", (event) => {
       if (event.payload.recordingId === recordingIdRef.current) {
         setTranscriptionProgress(event.payload.progress);
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<JobFailed>("job-failed", (event) => {
+      if (event.payload.recordingId === recordingIdRef.current) {
+        setError(`${event.payload.stage} failed: ${event.payload.message}`);
       }
     });
     return () => {
@@ -279,9 +333,19 @@ function App() {
         createdAt: "",
         status: "recorded",
         detectedLanguage: null,
+        durationMs: null,
       });
       setTranscriptionProgress(null);
+      refreshRecordings();
     }
+  }
+
+  function selectRecording(recording: RecordingSummary) {
+    recordingIdRef.current = recording.id;
+    setPipeline(recording);
+    setTranscriptionProgress(null);
+    setExportedPath(null);
+    setSummary(null);
   }
 
   async function handleChangeRecordingsDir() {
@@ -314,6 +378,38 @@ function App() {
         <button disabled={busy || status !== "stopped"} onClick={handleChangeRecordingsDir}>
           Change folder…
         </button>
+      </section>
+
+      <section className="panel">
+        <h2>Recordings library</h2>
+        {recordings.length === 0 && <p className="output">No recordings yet.</p>}
+        {recordings.length > 0 && (
+          <table className="recordings-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Duration</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recordings.map((recording) => (
+                <tr
+                  key={recording.id}
+                  className={recording.id === pipeline?.id ? "selected" : undefined}
+                  onClick={() => selectRecording(recording)}
+                >
+                  <td>{formatCreatedAt(recording.createdAt)}</td>
+                  <td>{formatDuration(recording.durationMs)}</td>
+                  <td>
+                    {PIPELINE_LABEL[recording.status]}
+                    {recording.detectedLanguage && ` (${recording.detectedLanguage})`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </section>
 
       <section className="panel">

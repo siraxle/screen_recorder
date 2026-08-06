@@ -91,6 +91,9 @@ pub async fn stop_recording(
         .stop(&output_path)
         .await
         .map_err(|e| e.to_string())?;
+    // Best-effort: a missing/broken ffprobe shouldn't block the recording
+    // from being saved and queued for transcription.
+    let duration_ms = ffmpeg::probe_duration_ms(&result_path).await.ok();
 
     let recording_id = uuid::Uuid::new_v4().to_string();
     let job_id = {
@@ -102,6 +105,7 @@ pub async fn stop_recording(
                 &recording_id,
                 &video_path,
                 language_override.as_deref(),
+                duration_ms,
             )
         })
         .await

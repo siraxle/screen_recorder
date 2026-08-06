@@ -28,6 +28,18 @@ struct TranscriptionProgress {
     progress: f64,
 }
 
+/// Payload for the `job-failed` event -- surfaces an async job's error to
+/// the UI even when the recording's persisted status doesn't change (e.g. a
+/// failed `summarize` job reverts to `transcribed` rather than `failed`, see
+/// `process_job`, so the error would otherwise be silently lost).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobFailed {
+    recording_id: String,
+    stage: String,
+    message: String,
+}
+
 /// Spawns the single background worker that drains the job queue. One
 /// worker, sequential processing: there is one GPU and one model instance,
 /// so no concurrency is needed at this scope.
@@ -117,12 +129,30 @@ async fn process_job(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> R
         Err(e) => {
             let message = format!("{e:#}");
             let job_id = job.id.clone();
-            db::with_db(db, move |conn| db::set_job_failed(conn, &job_id, &message)).await?;
+            let stored_message = message.clone();
+            db::with_db(db, move |conn| db::set_job_failed(conn, &job_id, &stored_message)).await?;
+            // A failed `summarize` job leaves a perfectly good transcript in
+            // place (F3 is a user-triggered step layered on top of F2, per
+            // CLAUDE.md's job-queue stages) -- only `transcribe` failing
+            // means there's no usable transcript, so only that stage should
+            // stamp the recording as `failed`.
+            let revert_status = match job.stage.as_str() {
+                "summarize" => PipelineStatus::Transcribed,
+                _ => PipelineStatus::Failed,
+            };
             let rid = recording_id.clone();
             db::with_db(db, move |conn| {
-                db::set_recording_status(conn, &rid, PipelineStatus::Failed)
+                db::set_recording_status(conn, &rid, revert_status)
             })
             .await?;
+            let _ = app_handle.emit(
+                "job-failed",
+                JobFailed {
+                    recording_id: recording_id.clone(),
+                    stage: job.stage.clone(),
+                    message,
+                },
+            );
         }
     }
     emit_update(app_handle, db, &recording_id).await;
@@ -290,7 +320,7 @@ mod tests {
             let rid = recording_id.clone();
             let vp = video_path.clone();
             db::with_db(&db, move |conn| {
-                db::insert_recording_with_transcribe_job(conn, &rid, &vp, None)
+                db::insert_recording_with_transcribe_job(conn, &rid, &vp, None, None)
             })
             .await
             .unwrap();
@@ -348,7 +378,7 @@ mod tests {
             let rid = recording_id.clone();
             let vp = video_path.clone();
             db::with_db(&db, move |conn| {
-                db::insert_recording_with_transcribe_job(conn, &rid, &vp, None)
+                db::insert_recording_with_transcribe_job(conn, &rid, &vp, None, None)
             })
             .await
             .unwrap();
