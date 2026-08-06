@@ -51,6 +51,48 @@ pub fn segments_to_vtt(segments: &[Segment]) -> String {
     out
 }
 
+/// F9's default dual-subtitle export: one cue per original segment, with the
+/// translation as a second line underneath. Timecodes come from `original`
+/// (translation preserves them 1:1 — see `pipeline::run_translation` — but
+/// `original` is the authoritative source in case the two ever drift). Pairs
+/// by index and silently drops any tail past `original`'s length rather than
+/// panicking, since a partial/failed translation run can leave the two
+/// slightly out of sync.
+pub fn dual_segments_to_srt(original: &[Segment], translated: &[Segment]) -> String {
+    let mut out = String::new();
+    for (index, pair) in original.iter().zip(translated.iter()).enumerate() {
+        let (orig, trans) = pair;
+        out.push_str(&format!("{}\n", index + 1));
+        out.push_str(&format!(
+            "{} --> {}\n",
+            format_timecode_srt(orig.start_ms),
+            format_timecode_srt(orig.end_ms)
+        ));
+        out.push_str(orig.text.trim());
+        out.push('\n');
+        out.push_str(trans.text.trim());
+        out.push_str("\n\n");
+    }
+    out
+}
+
+pub fn dual_segments_to_vtt(original: &[Segment], translated: &[Segment]) -> String {
+    let mut out = String::from("WEBVTT\n\n");
+    for pair in original.iter().zip(translated.iter()) {
+        let (orig, trans) = pair;
+        out.push_str(&format!(
+            "{} --> {}\n",
+            format_timecode_vtt(orig.start_ms),
+            format_timecode_vtt(orig.end_ms)
+        ));
+        out.push_str(orig.text.trim());
+        out.push('\n');
+        out.push_str(trans.text.trim());
+        out.push_str("\n\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +134,36 @@ mod tests {
     fn empty_segments_produce_srt_with_only_trailing_content() {
         assert_eq!(segments_to_srt(&[]), "");
         assert_eq!(segments_to_vtt(&[]), "WEBVTT\n\n");
+    }
+
+    fn sample_translated() -> Vec<Segment> {
+        vec![
+            Segment { start_ms: 0, end_ms: 1500, text: "Привет.".to_string() },
+            Segment { start_ms: 1500, end_ms: 3661_250, text: "Вторая строка.".to_string() },
+        ]
+    }
+
+    #[test]
+    fn dual_srt_puts_translation_on_a_second_line_per_cue() {
+        let srt = dual_segments_to_srt(&sample_segments(), &sample_translated());
+        assert_eq!(
+            srt,
+            "1\n00:00:00,000 --> 00:00:01,500\nHello there.\nПривет.\n\n\
+             2\n00:00:01,500 --> 01:01:01,250\nSecond line.\nВторая строка.\n\n"
+        );
+    }
+
+    #[test]
+    fn dual_vtt_has_header_and_two_lines_per_cue() {
+        let vtt = dual_segments_to_vtt(&sample_segments(), &sample_translated());
+        assert!(vtt.starts_with("WEBVTT\n\n"));
+        assert!(vtt.contains("00:00:00.000 --> 00:00:01.500\nHello there.\nПривет.\n\n"));
+    }
+
+    #[test]
+    fn dual_ignores_translated_tail_past_original_length() {
+        let original = vec![sample_segments()[0].clone()];
+        let srt = dual_segments_to_srt(&original, &sample_translated());
+        assert_eq!(srt.matches("-->").count(), 1);
     }
 }

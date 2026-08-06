@@ -72,6 +72,7 @@ pub fn run() {
             commands::check_local_llm_connection,
             commands::generate_summary,
             commands::get_summary,
+            commands::translate_subtitles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

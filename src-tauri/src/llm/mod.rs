@@ -231,6 +231,29 @@ pub async fn complete(
     Ok(content)
 }
 
+/// F8: translates a single subtitle segment's text. Called once per segment
+/// (not on the concatenated transcript) so a failure only drops one cue —
+/// see CLAUDE.md's "translate segment-by-segment ... so timecodes stay
+/// aligned" and F8's "failed segment marked as untranslated rather than
+/// aborting the entire process" criterion, which `pipeline::run_translation`
+/// implements by catching this call's `Err` per segment.
+pub async fn translate_segment(
+    settings: &LlmSettings,
+    cloud_token: Option<&str>,
+    text: &str,
+    source_language: &str,
+    target_language: &str,
+) -> Result<String, ProviderError> {
+    let system = format!(
+        "You translate subtitle lines from the language with ISO 639-1 code \
+         \"{source_language}\" to the language with ISO 639-1 code \
+         \"{target_language}\". Respond with ONLY the translated line — no \
+         quotes, no explanation, no original text — preserving tone and meaning."
+    );
+    let reply = complete(settings, cloud_token, &system, text).await?;
+    Ok(reply.trim().to_string())
+}
+
 /// F4's "check the endpoint's availability" criterion — local provider only,
 /// since a cloud probe has no meaningful "no token" mode.
 pub async fn check_connection(base_url: &str) -> Result<()> {
@@ -332,6 +355,24 @@ mod tests {
             .await
             .expect_err("should fail without attempting a request");
         assert!(matches!(err, ProviderError::MissingCloudToken));
+    }
+
+    #[tokio::test]
+    async fn translate_segment_returns_trimmed_reply() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "  Bonjour le monde  "}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let settings = settings_for(server.uri());
+        let translated = translate_segment(&settings, None, "Hello world", "en", "fr")
+            .await
+            .expect("should succeed");
+        assert_eq!(translated, "Bonjour le monde");
     }
 
     #[test]

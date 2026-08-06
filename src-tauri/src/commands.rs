@@ -190,39 +190,137 @@ pub async fn get_transcript(
     .map_err(|e| e.to_string())
 }
 
+/// `export_subtitles`'s response. A `Vec` rather than a single path because
+/// F9's "export as separate files" mode produces two files
+/// (`original.<lang>.srt` + `translated.<lang>.srt`) from one call.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSubtitlesResult {
+    pub paths: Vec<String>,
+}
+
+fn render_subtitles(format: &str, segments: &[Segment]) -> String {
+    if format == "srt" {
+        subtitle::segments_to_srt(segments)
+    } else {
+        subtitle::segments_to_vtt(segments)
+    }
+}
+
+fn render_dual_subtitles(format: &str, original: &[Segment], translated: &[Segment]) -> String {
+    if format == "srt" {
+        subtitle::dual_segments_to_srt(original, translated)
+    } else {
+        subtitle::dual_segments_to_vtt(original, translated)
+    }
+}
+
+fn write_subtitle_file(video_path: &std::path::Path, file_name: &str, contents: String) -> Result<String, String> {
+    let path = video_path
+        .parent()
+        .map(|dir| dir.join(file_name))
+        .unwrap_or_else(|| PathBuf::from(file_name));
+    std::fs::write(&path, contents).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// F2/F8/F9's subtitle export, covering three modes:
+/// - `"original"`: the transcript in the video's own (detected/overridden)
+///   language — F2's baseline "Export subtitles."
+/// - `"translated"`: the transcript translated into `language` (requires a
+///   prior `translate_subtitles` call for that language — F8).
+/// - `"dual"`: both together, either as one file with two lines per cue
+///   (default) or, when `separate_files` is set, as
+///   `original.<lang>.<format>` + `translated.<lang>.<format>` (F9).
 #[tauri::command]
 pub async fn export_subtitles(
     state: State<'_, AppState>,
     recording_id: String,
     format: String,
-) -> Result<String, String> {
+    mode: String,
+    language: Option<String>,
+    separate_files: bool,
+) -> Result<ExportSubtitlesResult, String> {
     if format != "srt" && format != "vtt" {
         return Err(format!("unsupported subtitle format: {format}"));
     }
+    if mode != "original" && mode != "translated" && mode != "dual" {
+        return Err(format!("unsupported export mode: {mode}"));
+    }
 
     let video_path = {
-        let recording_id = recording_id.clone();
-        db::with_db(&state.db, move |conn| {
-            db::get_recording_video_path(conn, &recording_id)
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::get_recording_video_path(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    if mode == "original" {
+        let segments = db::with_db(&state.db, move |conn| {
+            db::get_transcript_segments(conn, &recording_id)
         })
         .await
-        .map_err(|e| e.to_string())?
-    };
-    let segments = db::with_db(&state.db, move |conn| {
-        db::get_transcript_segments(conn, &recording_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
+        let contents = render_subtitles(&format, &segments);
+        let output_path = video_path.with_extension(&format);
+        std::fs::write(&output_path, contents).map_err(|e| e.to_string())?;
+        return Ok(ExportSubtitlesResult { paths: vec![output_path.to_string_lossy().to_string()] });
+    }
 
-    let contents = if format == "srt" {
-        subtitle::segments_to_srt(&segments)
+    let language = language.filter(|l| !l.trim().is_empty()).ok_or_else(|| {
+        "a target language is required for a translated or dual export".to_string()
+    })?;
+    let translated = {
+        let rid = recording_id.clone();
+        let lang = language.clone();
+        db::with_db(&state.db, move |conn| db::get_translated_segments(conn, &rid, &lang))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if translated.is_empty() {
+        return Err("no translation available for this language yet — run Translate first".to_string());
+    }
+
+    if mode == "translated" {
+        let contents = render_subtitles(&format, &translated);
+        let path = write_subtitle_file(&video_path, &format!("{language}.{format}"), contents)?;
+        return Ok(ExportSubtitlesResult { paths: vec![path] });
+    }
+
+    // mode == "dual"
+    let original = {
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::get_transcript_segments(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if separate_files {
+        let original_language = {
+            let rid = recording_id.clone();
+            db::with_db(&state.db, move |conn| db::get_recording_summary(conn, &rid))
+                .await
+                .map_err(|e| e.to_string())?
+                .detected_language
+                .unwrap_or_else(|| "original".to_string())
+        };
+        let original_contents = render_subtitles(&format, &original);
+        let translated_contents = render_subtitles(&format, &translated);
+        let original_path = write_subtitle_file(
+            &video_path,
+            &format!("original.{original_language}.{format}"),
+            original_contents,
+        )?;
+        let translated_path = write_subtitle_file(
+            &video_path,
+            &format!("translated.{language}.{format}"),
+            translated_contents,
+        )?;
+        Ok(ExportSubtitlesResult { paths: vec![original_path, translated_path] })
     } else {
-        subtitle::segments_to_vtt(&segments)
-    };
-
-    let output_path = video_path.with_extension(&format);
-    std::fs::write(&output_path, contents).map_err(|e| e.to_string())?;
-    Ok(output_path.to_string_lossy().to_string())
+        let contents = render_dual_subtitles(&format, &original, &translated);
+        let path = write_subtitle_file(&video_path, &format!("dual.{language}.{format}"), contents)?;
+        Ok(ExportSubtitlesResult { paths: vec![path] })
+    }
 }
 
 /// `get_llm_settings`'s response: provider config plus whether a cloud token
@@ -293,6 +391,33 @@ pub async fn generate_summary(
         return Err("no transcript available for this recording yet".to_string());
     }
 
+    ensure_llm_provider_configured(&state).await?;
+
+    {
+        let rid = recording_id.clone();
+        let lang = summary_language.clone();
+        db::with_db(&state.db, move |conn| {
+            db::set_recording_summary_language_override(conn, &rid, lang.as_deref())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    let job_id = {
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::insert_summarize_job(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let _ = state.job_tx.send(job_id);
+    Ok(())
+}
+
+/// Shared by `generate_summary` and `translate_subtitles`: both need a
+/// usable LLM provider before enqueueing a job, so an unconfigured/invalid
+/// provider produces a clear error without any transcript data ever being
+/// sent anywhere (F3/F8's "clear error, no data sent" criteria).
+async fn ensure_llm_provider_configured(state: &State<'_, AppState>) -> Result<(), String> {
     let settings = db::with_db(&state.db, |conn| llm::load_settings(conn))
         .await
         .map_err(|e| e.to_string())?;
@@ -311,12 +436,41 @@ pub async fn generate_summary(
             }
         }
     }
+    Ok(())
+}
+
+/// Validates that a transcript and a usable provider both exist, then
+/// enqueues a `translate` job (F8). Mirrors `generate_summary`'s validation
+/// order for the same reason: no data goes anywhere until the provider is
+/// confirmed usable.
+#[tauri::command]
+pub async fn translate_subtitles(
+    state: State<'_, AppState>,
+    recording_id: String,
+    target_language: String,
+) -> Result<(), String> {
+    let target_language = target_language.trim().to_string();
+    if target_language.is_empty() {
+        return Err("a target language is required".to_string());
+    }
+
+    let segments = {
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::get_transcript_segments(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if segments.is_empty() {
+        return Err("no transcript available for this recording yet".to_string());
+    }
+
+    ensure_llm_provider_configured(&state).await?;
 
     {
         let rid = recording_id.clone();
-        let lang = summary_language.clone();
+        let lang = target_language.clone();
         db::with_db(&state.db, move |conn| {
-            db::set_recording_summary_language_override(conn, &rid, lang.as_deref())
+            db::set_recording_subtitle_language_override(conn, &rid, Some(&lang))
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -324,7 +478,7 @@ pub async fn generate_summary(
 
     let job_id = {
         let rid = recording_id.clone();
-        db::with_db(&state.db, move |conn| db::insert_summarize_job(conn, &rid))
+        db::with_db(&state.db, move |conn| db::insert_translate_job(conn, &rid))
             .await
             .map_err(|e| e.to_string())?
     };

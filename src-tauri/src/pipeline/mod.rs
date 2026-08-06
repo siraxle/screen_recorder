@@ -40,6 +40,23 @@ struct JobFailed {
     message: String,
 }
 
+/// Payload for the `translation-updated` event (F8). A `translate` job never
+/// touches `recordings.status` (see `process_translate_job`'s doc comment),
+/// so unlike `transcribe`/`summarize` there's no `recording-updated` event to
+/// piggyback progress on -- the UI needs its own signal to know when a
+/// translation finished and whether any segments fell back to the original
+/// text.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationUpdate {
+    recording_id: String,
+    language: String,
+    status: &'static str, // "done" | "failed"
+    failed_segments: usize,
+    total_segments: usize,
+    message: Option<String>,
+}
+
 /// Spawns the single background worker that drains the job queue. One
 /// worker, sequential processing: there is one GPU and one model instance,
 /// so no concurrency is needed at this scope.
@@ -85,6 +102,16 @@ async fn process_job(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> R
     if job.status != "pending" {
         return Ok(());
     }
+
+    // `translate` is handled entirely separately: it must never write
+    // `recordings.status` (see `process_translate_job`'s doc comment on why
+    // a single status column can't represent it running concurrently with
+    // `summarize`), so it doesn't fit the status-transition bookkeeping the
+    // rest of this function does for `transcribe`/`summarize`.
+    if job.stage == "translate" {
+        return process_translate_job(db, app_handle, &job).await;
+    }
+
     let recording_id = job.recording_id.clone();
 
     let in_progress_status = match job.stage.as_str() {
@@ -279,6 +306,138 @@ async fn run_summarization(db: &SharedConn, recording_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Runs a `translate` job (F8) end to end: job bookkeeping, translation,
+/// and the `translation-updated` event -- but deliberately never touches
+/// `recordings.status`. Per CLAUDE.md, `translating` must be able to run
+/// concurrently with `summarizing`, and `recordings.status` is a single
+/// denormalized column that can't represent two stages in flight at once
+/// (see the "source of truth" note atop `db.rs`), so this stage is tracked
+/// only through the `jobs` table and this dedicated event.
+async fn process_translate_job(
+    db: &SharedConn,
+    app_handle: &AppHandle,
+    job: &db::JobRow,
+) -> Result<()> {
+    {
+        let job_id = job.id.clone();
+        db::with_db(db, move |conn| db::set_job_running(conn, &job_id)).await?;
+    }
+
+    let recording_id = job.recording_id.clone();
+    let target_language = {
+        let rid = recording_id.clone();
+        db::with_db(db, move |conn| db::get_recording_subtitle_language_override(conn, &rid))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no subtitle language set for translation"))?
+    };
+
+    let outcome = run_translation(db, &recording_id, &target_language).await;
+
+    let event = match &outcome {
+        Ok(o) => {
+            let job_id = job.id.clone();
+            db::with_db(db, move |conn| db::set_job_done(conn, &job_id)).await?;
+            TranslationUpdate {
+                recording_id: recording_id.clone(),
+                language: target_language.clone(),
+                status: "done",
+                failed_segments: o.failed_segments,
+                total_segments: o.total_segments,
+                message: None,
+            }
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            let job_id = job.id.clone();
+            let stored_message = message.clone();
+            db::with_db(db, move |conn| db::set_job_failed(conn, &job_id, &stored_message)).await?;
+            TranslationUpdate {
+                recording_id: recording_id.clone(),
+                language: target_language.clone(),
+                status: "failed",
+                failed_segments: 0,
+                total_segments: 0,
+                message: Some(message),
+            }
+        }
+    };
+    let _ = app_handle.emit("translation-updated", event);
+    Ok(())
+}
+
+struct TranslationOutcome {
+    failed_segments: usize,
+    total_segments: usize,
+}
+
+/// F8: translates the persisted transcript segment-by-segment, preserving
+/// each segment's timecodes (CLAUDE.md's subtitle-translation convention).
+/// A segment whose translation call fails keeps its original text rather
+/// than aborting the whole job (F8's Given/When/Then for a failed segment) --
+/// `failed_segments` in the returned outcome lets the UI surface that some
+/// cues fell back to the original.
+async fn run_translation(
+    db: &SharedConn,
+    recording_id: &str,
+    target_language: &str,
+) -> Result<TranslationOutcome> {
+    let segments = {
+        let rid = recording_id.to_string();
+        db::with_db(db, move |conn| db::get_transcript_segments(conn, &rid)).await?
+    };
+    if segments.is_empty() {
+        return Err(anyhow::anyhow!("no transcript available to translate"));
+    }
+
+    let source_language = {
+        let rid = recording_id.to_string();
+        db::with_db(db, move |conn| db::get_recording_summary(conn, &rid))
+            .await?
+            .detected_language
+            .unwrap_or_else(|| "the source language".to_string())
+    };
+
+    let settings = db::with_db(db, |conn| llm::load_settings(conn)).await?;
+    let cloud_token = llm::read_cloud_token()?;
+
+    let total_segments = segments.len();
+    let mut translated = Vec::with_capacity(total_segments);
+    let mut failed_segments = 0usize;
+    for segment in &segments {
+        match llm::translate_segment(
+            &settings,
+            cloud_token.as_deref(),
+            &segment.text,
+            &source_language,
+            target_language,
+        )
+        .await
+        {
+            Ok(text) => translated.push(db::Segment {
+                start_ms: segment.start_ms,
+                end_ms: segment.end_ms,
+                text,
+            }),
+            Err(e) => {
+                tracing::warn!("segment translation failed, keeping original text: {e:#}");
+                failed_segments += 1;
+                translated.push(segment.clone());
+            }
+        }
+    }
+
+    {
+        let rid = recording_id.to_string();
+        let lang = target_language.to_string();
+        db::with_db(db, move |conn| {
+            db::replace_translated_segments(conn, &rid, &lang, &translated)
+        })
+        .await?;
+    }
+
+    Ok(TranslationOutcome { failed_segments, total_segments })
+}
+
 async fn emit_update(app_handle: &AppHandle, db: &SharedConn, recording_id: &str) {
     let rid = recording_id.to_string();
     if let Ok(summary) = db::with_db(db, move |conn| db::get_recording_summary(conn, &rid)).await {
@@ -438,5 +597,156 @@ mod tests {
         assert_eq!(summary.overview, "a test overview");
         assert_eq!(summary.key_points, vec!["point one".to_string()]);
         assert_eq!(summary.language, "en");
+    }
+
+    /// F8's Given/When/Then: a ready transcript translated segment-by-segment
+    /// via LLM, with each translated segment's timecodes matching the
+    /// original.
+    #[tokio::test]
+    async fn run_translation_persists_translated_segments_with_matching_timecodes() {
+        let base_dir = std::env::temp_dir().join("screen_recorder_translate_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let db = db::open(&base_dir.join("db.sqlite3")).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "Bonjour le monde"}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let recording_id = uuid::Uuid::new_v4().to_string();
+        let video_path = base_dir.join("fake_recording.mp4");
+        {
+            let rid = recording_id.clone();
+            let vp = video_path.clone();
+            db::with_db(&db, move |conn| {
+                db::insert_recording_with_transcribe_job(conn, &rid, &vp, None, None)
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| {
+                db::replace_transcript_segments(
+                    conn,
+                    &rid,
+                    &[db::Segment { start_ms: 0, end_ms: 1000, text: "hello world".to_string() }],
+                )
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| db::set_recording_detected_language(conn, &rid, "en"))
+                .await
+                .unwrap();
+        }
+        {
+            let server_uri = server.uri();
+            db::with_db(&db, move |conn| {
+                let settings = llm::LlmSettings {
+                    provider: llm::ProviderKind::Local,
+                    local_base_url: server_uri,
+                    local_model: "test-model".to_string(),
+                    ..llm::LlmSettings::default()
+                };
+                llm::save_settings(conn, &settings)
+            })
+            .await
+            .unwrap();
+        }
+
+        let outcome = run_translation(&db, &recording_id, "fr")
+            .await
+            .expect("translation should succeed");
+        assert_eq!(outcome.failed_segments, 0);
+        assert_eq!(outcome.total_segments, 1);
+
+        let translated = {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| db::get_translated_segments(conn, &rid, "fr"))
+                .await
+                .unwrap()
+        };
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].text, "Bonjour le monde");
+        assert_eq!(translated[0].start_ms, 0);
+        assert_eq!(translated[0].end_ms, 1000);
+    }
+
+    /// F8's failure Given/When/Then: a segment whose translation call fails
+    /// keeps its original text and the job still completes (rather than
+    /// aborting), with the failure counted in the outcome.
+    #[tokio::test]
+    async fn run_translation_falls_back_to_original_text_on_provider_error() {
+        let base_dir = std::env::temp_dir().join("screen_recorder_translate_fail_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let db = db::open(&base_dir.join("db.sqlite3")).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let recording_id = uuid::Uuid::new_v4().to_string();
+        let video_path = base_dir.join("fake_recording.mp4");
+        {
+            let rid = recording_id.clone();
+            let vp = video_path.clone();
+            db::with_db(&db, move |conn| {
+                db::insert_recording_with_transcribe_job(conn, &rid, &vp, None, None)
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| {
+                db::replace_transcript_segments(
+                    conn,
+                    &rid,
+                    &[db::Segment { start_ms: 0, end_ms: 1000, text: "hello world".to_string() }],
+                )
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let server_uri = server.uri();
+            db::with_db(&db, move |conn| {
+                let settings = llm::LlmSettings {
+                    provider: llm::ProviderKind::Local,
+                    local_base_url: server_uri,
+                    local_model: "test-model".to_string(),
+                    ..llm::LlmSettings::default()
+                };
+                llm::save_settings(conn, &settings)
+            })
+            .await
+            .unwrap();
+        }
+
+        let outcome = run_translation(&db, &recording_id, "fr")
+            .await
+            .expect("job should still complete despite a failed segment");
+        assert_eq!(outcome.failed_segments, 1);
+        assert_eq!(outcome.total_segments, 1);
+
+        let translated = {
+            let rid = recording_id.clone();
+            db::with_db(&db, move |conn| db::get_translated_segments(conn, &rid, "fr"))
+                .await
+                .unwrap()
+        };
+        assert_eq!(translated[0].text, "hello world", "should fall back to the original text");
     }
 }

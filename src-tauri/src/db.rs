@@ -116,6 +116,30 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply migration to user_version 5")?;
     }
+    if version < 6 {
+        // F8/F9: translated subtitles. `subtitle_language_override` is the
+        // target language for the next `translate` job (mirrors
+        // `summary_language_override`'s "set immediately before enqueueing"
+        // convention). `translated_segments` is keyed by (recording_id,
+        // language) rather than just recording_id so a prior translation
+        // isn't lost if the user picks a different subtitle language later.
+        conn.execute_batch(
+            "
+            ALTER TABLE recordings ADD COLUMN subtitle_language_override TEXT;
+            CREATE TABLE translated_segments (
+                recording_id TEXT NOT NULL REFERENCES recordings(id),
+                language TEXT NOT NULL,
+                segment_index INTEGER NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                PRIMARY KEY (recording_id, language, segment_index)
+            );
+            PRAGMA user_version = 6;
+            ",
+        )
+        .context("failed to apply migration to user_version 6")?;
+    }
     Ok(())
 }
 
@@ -298,6 +322,22 @@ pub fn insert_summarize_job(conn: &Connection, recording_id: &str) -> Result<Str
     Ok(job_id)
 }
 
+/// Inserts a `translate` job for a recording whose transcript is already
+/// ready (F8: like `summarize`, user-triggered and layered on top of F2).
+/// Deliberately independent of any `summarize` job for the same recording —
+/// per CLAUDE.md, `translating` must be able to run concurrently with
+/// `summarizing` rather than blocking it.
+pub fn insert_translate_job(conn: &Connection, recording_id: &str) -> Result<String> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let created_at = now();
+    conn.execute(
+        "INSERT INTO jobs (id, recording_id, stage, status, error, created_at, updated_at)
+         VALUES (?1, ?2, 'translate', ?3, NULL, ?4, ?4)",
+        rusqlite::params![job_id, recording_id, JobStatus::Pending.as_str(), created_at],
+    )?;
+    Ok(job_id)
+}
+
 /// Resets any job left `running` by a previous crashed run back to
 /// `pending` (transcription is all-or-nothing, so re-running from `pending`
 /// is the correct resume point), then returns every pending job id so the
@@ -412,6 +452,33 @@ pub fn get_recording_summary_language_override(
 ) -> Result<Option<String>> {
     conn.query_row(
         "SELECT summary_language_override FROM recordings WHERE id = ?1",
+        [recording_id],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("recording {recording_id} not found"))
+}
+
+/// `None` means "subtitles use the video language, no translation" (F8's
+/// default). Set immediately before enqueueing a `translate` job, mirroring
+/// `set_recording_summary_language_override`.
+pub fn set_recording_subtitle_language_override(
+    conn: &Connection,
+    recording_id: &str,
+    language: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recordings SET subtitle_language_override = ?1 WHERE id = ?2",
+        rusqlite::params![language, recording_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_recording_subtitle_language_override(
+    conn: &Connection,
+    recording_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT subtitle_language_override FROM recordings WHERE id = ?1",
         [recording_id],
         |row| row.get(0),
     )
@@ -566,4 +633,61 @@ pub fn get_summary(conn: &Connection, recording_id: &str) -> Result<Option<Summa
         Ok(Summary { overview, key_points, language })
     })
     .transpose()
+}
+
+/// Replaces the cached translation for `(recording_id, language)` (F8: a
+/// segment-by-segment translation, so a failed segment's original text is
+/// already baked into `segments` by the caller — see `pipeline::run_translation`).
+/// Keyed by language rather than a single slot per recording so re-running
+/// `list_recordings`/export after switching subtitle language doesn't lose
+/// an earlier translation.
+pub fn replace_translated_segments(
+    conn: &Connection,
+    recording_id: &str,
+    language: &str,
+    segments: &[Segment],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM translated_segments WHERE recording_id = ?1 AND language = ?2",
+        rusqlite::params![recording_id, language],
+    )?;
+    for (index, segment) in segments.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO translated_segments (recording_id, language, segment_index, start_ms, end_ms, text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recording_id,
+                language,
+                index as i64,
+                segment.start_ms,
+                segment.end_ms,
+                segment.text,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Empty when no translation has been generated yet for this language (the
+/// caller — `commands::export_subtitles` — treats that as "run Translate
+/// first" rather than exporting an empty file).
+pub fn get_translated_segments(
+    conn: &Connection,
+    recording_id: &str,
+    language: &str,
+) -> Result<Vec<Segment>> {
+    let mut stmt = conn.prepare(
+        "SELECT start_ms, end_ms, text FROM translated_segments
+         WHERE recording_id = ?1 AND language = ?2 ORDER BY segment_index ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![recording_id, language], |row| {
+            Ok(Segment {
+                start_ms: row.get(0)?,
+                end_ms: row.get(1)?,
+                text: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }

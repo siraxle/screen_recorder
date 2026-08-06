@@ -64,6 +64,19 @@ interface JobFailed {
   message: string;
 }
 
+interface TranslationUpdate {
+  recordingId: string;
+  language: string;
+  status: "done" | "failed";
+  failedSegments: number;
+  totalSegments: number;
+  message: string | null;
+}
+
+interface ExportSubtitlesResult {
+  paths: string[];
+}
+
 const LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
   { code: "", label: "Auto-detect" },
   { code: "en", label: "English" },
@@ -72,6 +85,14 @@ const LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
   { code: "de", label: "German" },
   { code: "fr", label: "French" },
   { code: "other", label: "Other (enter code)" },
+];
+
+// F8: subtitle language defaults to "same as video" (no translation), unlike
+// the transcript-language picker's "auto-detect" default — the two settings
+// are deliberately distinct (CLAUDE.md: "never conflate them").
+const SUBTITLE_LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
+  { code: "", label: "Same as video (no translation)" },
+  ...LANGUAGE_OPTIONS.slice(1),
 ];
 
 const PIPELINE_LABEL: Record<PipelineStatus, string> = {
@@ -125,7 +146,7 @@ function App() {
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [pipeline, setPipeline] = useState<RecordingSummary | null>(null);
   const [transcriptionProgress, setTranscriptionProgress] = useState<number | null>(null);
-  const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [exportedPaths, setExportedPaths] = useState<string[] | null>(null);
   const [recordingsDir, setRecordingsDir] = useState<string>("");
   const recordingIdRef = useRef<string | null>(null);
 
@@ -137,6 +158,14 @@ function App() {
   const [summaryLanguage, setSummaryLanguage] = useState<string>("");
   const [customSummaryLanguage, setCustomSummaryLanguage] = useState<string>("");
   const [summary, setSummary] = useState<Summary | null>(null);
+
+  const [subtitleLanguage, setSubtitleLanguage] = useState<string>("");
+  const [customSubtitleLanguage, setCustomSubtitleLanguage] = useState<string>("");
+  const [dualSubtitles, setDualSubtitles] = useState(false);
+  const [separateSubtitleFiles, setSeparateSubtitleFiles] = useState(false);
+  const [translating, setTranslating] = useState(false);
+  const [translationInfo, setTranslationInfo] = useState<string | null>(null);
+  const [translatedLanguages, setTranslatedLanguages] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     invoke<string[]>("list_microphones")
@@ -216,6 +245,26 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const unlisten = listen<TranslationUpdate>("translation-updated", (event) => {
+      if (event.payload.recordingId !== recordingIdRef.current) return;
+      setTranslating(false);
+      if (event.payload.status === "done") {
+        setTranslatedLanguages((prev) => new Set(prev).add(event.payload.language));
+        setTranslationInfo(
+          event.payload.failedSegments > 0
+            ? `Translated to ${event.payload.language} — ${event.payload.failedSegments} of ${event.payload.totalSegments} segments kept the original text (translation failed for those).`
+            : `Translated to ${event.payload.language}.`
+        );
+      } else {
+        setTranslationInfo(`Translation failed: ${event.payload.message ?? "unknown error"}`);
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   async function run<T>(action: () => Promise<T>) {
     setBusy(true);
     setError(null);
@@ -239,6 +288,12 @@ function App() {
     if (summaryLanguage === "") return null;
     if (summaryLanguage === "other") return customSummaryLanguage.trim() || null;
     return summaryLanguage;
+  }
+
+  function resolveSubtitleLanguage(): string | null {
+    if (subtitleLanguage === "") return null;
+    if (subtitleLanguage === "other") return customSubtitleLanguage.trim() || null;
+    return subtitleLanguage;
   }
 
   async function handleSaveLlmSettings() {
@@ -292,11 +347,27 @@ function App() {
     );
   }
 
+  async function handleTranslate() {
+    if (!pipeline) return;
+    const targetLanguage = resolveSubtitleLanguage();
+    if (!targetLanguage) return;
+    setTranslating(true);
+    setTranslationInfo(null);
+    try {
+      await invoke("translate_subtitles", { recordingId: pipeline.id, targetLanguage });
+    } catch (e) {
+      setTranslating(false);
+      setError(String(e));
+    }
+  }
+
   async function handleStart() {
     setPipeline(null);
     setTranscriptionProgress(null);
-    setExportedPath(null);
+    setExportedPaths(null);
     setSummary(null);
+    setTranslatedLanguages(new Set());
+    setTranslationInfo(null);
     recordingIdRef.current = null;
     const config: CaptureConfig = {
       captureSystemAudio,
@@ -344,8 +415,10 @@ function App() {
     recordingIdRef.current = recording.id;
     setPipeline(recording);
     setTranscriptionProgress(null);
-    setExportedPath(null);
+    setExportedPaths(null);
     setSummary(null);
+    setTranslatedLanguages(new Set());
+    setTranslationInfo(null);
   }
 
   async function handleChangeRecordingsDir() {
@@ -357,10 +430,18 @@ function App() {
 
   async function handleExport(format: "srt" | "vtt") {
     if (!pipeline) return;
-    const path = await run(() =>
-      invoke<string>("export_subtitles", { recordingId: pipeline.id, format })
+    const language = resolveSubtitleLanguage();
+    const mode = language === null ? "original" : dualSubtitles ? "dual" : "translated";
+    const result = await run(() =>
+      invoke<ExportSubtitlesResult>("export_subtitles", {
+        recordingId: pipeline.id,
+        format,
+        mode,
+        language,
+        separateFiles: mode === "dual" ? separateSubtitleFiles : false,
+      })
     );
-    if (path) setExportedPath(path);
+    if (result) setExportedPaths(result.paths);
   }
 
   return (
@@ -626,18 +707,92 @@ function App() {
           {(pipeline.status === "transcribed" ||
             pipeline.status === "summarizing" ||
             pipeline.status === "summarized") && (
-            <div className="controls">
-              <button disabled={busy} onClick={() => handleExport("srt")}>
-                Export .srt
-              </button>
-              <button disabled={busy} onClick={() => handleExport("vtt")}>
-                Export .vtt
-              </button>
+            <div className="panel">
+              <label className="checkbox-row">
+                Subtitle language
+                <select
+                  value={subtitleLanguage}
+                  onChange={(e) => setSubtitleLanguage(e.currentTarget.value)}
+                >
+                  {SUBTITLE_LANGUAGE_OPTIONS.map((option) => (
+                    <option key={option.code} value={option.code}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {subtitleLanguage === "other" && (
+                <input
+                  type="text"
+                  placeholder="ISO 639-1 code, e.g. pt"
+                  value={customSubtitleLanguage}
+                  onChange={(e) => setCustomSubtitleLanguage(e.currentTarget.value)}
+                />
+              )}
+
+              {resolveSubtitleLanguage() !== null && (
+                <>
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={dualSubtitles}
+                      onChange={(e) => setDualSubtitles(e.currentTarget.checked)}
+                    />
+                    Dual subtitles (original + translation)
+                  </label>
+                  {dualSubtitles && (
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={separateSubtitleFiles}
+                        onChange={(e) => setSeparateSubtitleFiles(e.currentTarget.checked)}
+                      />
+                      Export as separate files (original.&lt;lang&gt; + translated.&lt;lang&gt;)
+                    </label>
+                  )}
+                  <button disabled={busy || translating} onClick={handleTranslate}>
+                    {translating ? "Translating…" : "Translate"}
+                  </button>
+                  {translationInfo && <p className="output">{translationInfo}</p>}
+                </>
+              )}
+
+              <div className="controls">
+                <button
+                  disabled={
+                    busy ||
+                    (resolveSubtitleLanguage() !== null &&
+                      !translatedLanguages.has(resolveSubtitleLanguage() as string))
+                  }
+                  onClick={() => handleExport("srt")}
+                >
+                  Export .srt
+                </button>
+                <button
+                  disabled={
+                    busy ||
+                    (resolveSubtitleLanguage() !== null &&
+                      !translatedLanguages.has(resolveSubtitleLanguage() as string))
+                  }
+                  onClick={() => handleExport("vtt")}
+                >
+                  Export .vtt
+                </button>
+              </div>
+              {resolveSubtitleLanguage() !== null &&
+                !translatedLanguages.has(resolveSubtitleLanguage() as string) && (
+                  <p className="output">Run Translate before exporting.</p>
+                )}
             </div>
           )}
-          {exportedPath && (
+          {exportedPaths && exportedPaths.length > 0 && (
             <p className="output">
-              Subtitles saved to: <code>{exportedPath}</code>
+              Subtitles saved to:
+              {exportedPaths.map((p) => (
+                <code key={p} style={{ display: "block" }}>
+                  {p}
+                </code>
+              ))}
             </p>
           )}
 
