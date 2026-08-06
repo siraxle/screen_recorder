@@ -333,17 +333,19 @@ function App() {
               type="text"
               placeholder="Base URL, e.g. http://localhost:11434/v1"
               value={llmSettings.localBaseUrl}
-              onChange={(e) =>
-                setLlmSettings((prev) => ({ ...prev, localBaseUrl: e.currentTarget.value }))
-              }
+              onChange={(e) => {
+                const value = e.currentTarget.value;
+                setLlmSettings((prev) => ({ ...prev, localBaseUrl: value }));
+              }}
             />
             <input
               type="text"
               placeholder="Model, e.g. llama3.1"
               value={llmSettings.localModel}
-              onChange={(e) =>
-                setLlmSettings((prev) => ({ ...prev, localModel: e.currentTarget.value }))
-              }
+              onChange={(e) => {
+                const value = e.currentTarget.value;
+                setLlmSettings((prev) => ({ ...prev, localModel: value }));
+              }}
             />
             <button disabled={busy} onClick={handleCheckConnection}>
               Check connection
@@ -367,17 +369,19 @@ function App() {
               type="text"
               placeholder="Base URL, e.g. https://api.openai.com/v1"
               value={llmSettings.cloudBaseUrl}
-              onChange={(e) =>
-                setLlmSettings((prev) => ({ ...prev, cloudBaseUrl: e.currentTarget.value }))
-              }
+              onChange={(e) => {
+                const value = e.currentTarget.value;
+                setLlmSettings((prev) => ({ ...prev, cloudBaseUrl: value }));
+              }}
             />
             <input
               type="text"
               placeholder="Model, e.g. gpt-4o-mini"
               value={llmSettings.cloudModel}
-              onChange={(e) =>
-                setLlmSettings((prev) => ({ ...prev, cloudModel: e.currentTarget.value }))
-              }
+              onChange={(e) => {
+                const value = e.currentTarget.value;
+                setLlmSettings((prev) => ({ ...prev, cloudModel: value }));
+              }}
             />
             <label className="checkbox-row">
               API token
