@@ -67,7 +67,13 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
         .arg("desktop");
 
     if config.capture_microphone {
-        let mic = config.microphone_device.as_deref().unwrap_or("default");
+        // dshow has no "use OS default" device name; callers must resolve a
+        // concrete device (see `CaptureController::begin_segment`) before
+        // this is invoked.
+        let mic = config
+            .microphone_device
+            .as_deref()
+            .expect("capture_microphone requires a resolved microphone_device");
         cmd.arg("-f")
             .arg("dshow")
             .arg("-i")
@@ -199,11 +205,15 @@ pub async fn list_microphones() -> Result<Vec<String>> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut devices = Vec::new();
     for line in stderr.lines() {
-        if let Some(rest) = line.trim().strip_prefix('"') {
-            if line.contains("(audio)") {
-                if let Some(end) = rest.find('"') {
-                    devices.push(rest[..end].to_string());
-                }
+        // ffmpeg prefixes each line with a `[in#0 @ <addr>]`-style context
+        // tag, so the quoted device name never starts the line — search for
+        // the quotes rather than requiring them at position 0.
+        if !line.contains("(audio)") {
+            continue;
+        }
+        if let Some(start) = line.find('"') {
+            if let Some(len) = line[start + 1..].find('"') {
+                devices.push(line[start + 1..start + 1 + len].to_string());
             }
         }
     }

@@ -122,6 +122,18 @@ impl CaptureController {
             .work_dir
             .join(format!("segment-{:03}-video.mp4", self.segment_index));
 
+        // dshow has no "OS default microphone" device name, so an unset
+        // `microphone_device` is resolved here to a concrete device rather
+        // than passed through as a placeholder string.
+        if self.config.capture_microphone && self.config.microphone_device.is_none() {
+            let mics = ffmpeg::list_microphones()
+                .await
+                .context("failed to enumerate microphones")?;
+            self.config.microphone_device = Some(mics.into_iter().next().ok_or_else(|| {
+                anyhow!("microphone capture is enabled but no microphone device was found")
+            })?);
+        }
+
         let mut cmd = ffmpeg::build_segment_command(&self.config, &video_path);
         let mut video_child = cmd
             .spawn()
@@ -157,10 +169,20 @@ impl CaptureController {
         if let Some(mut stdin) = segment.video_child.stdin.take() {
             let _ = stdin.write_all(b"q").await;
         }
-        let _ = segment.video_child.wait().await;
+        let status = segment
+            .video_child
+            .wait()
+            .await
+            .context("failed to wait for video/mic ffmpeg process")?;
 
         if let Some(loopback) = segment.loopback.take() {
             loopback.stop()?;
+        }
+
+        if !status.success() {
+            return Err(anyhow!(
+                "ffmpeg (video/mic capture) exited with status {status}"
+            ));
         }
 
         match segment.loopback_pcm_path {
