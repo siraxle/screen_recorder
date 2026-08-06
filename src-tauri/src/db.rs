@@ -88,6 +88,25 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply migration to user_version 3")?;
     }
+    if version < 4 {
+        // Belt-and-suspenders re-check: some pre-release DBs reached
+        // user_version 3 before `summary_language_override` was added to
+        // that migration block, so this column may still be missing.
+        let has_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('recordings') WHERE name = 'summary_language_override'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("failed to inspect recordings columns")?
+            > 0;
+        if !has_column {
+            conn.execute_batch("ALTER TABLE recordings ADD COLUMN summary_language_override TEXT;")
+                .context("failed to add summary_language_override column")?;
+        }
+        conn.execute_batch("PRAGMA user_version = 4;")
+            .context("failed to apply migration to user_version 4")?;
+    }
     Ok(())
 }
 
