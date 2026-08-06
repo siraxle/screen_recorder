@@ -1,0 +1,13 @@
+use std::path::PathBuf;
+
+use tokio::sync::Mutex;
+
+use crate::capture::CaptureController;
+
+/// Recording state is a single optional controller: this prototype supports
+/// one active recording at a time, matching the F1 acceptance criteria
+/// (start/pause/resume/stop on a single in-progress recording).
+pub struct AppState {
+    pub controller: Mutex<Option<CaptureController>>,
+    pub recordings_dir: PathBuf,
+}

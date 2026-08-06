@@ -1,0 +1,216 @@
+use std::path::Path;
+use std::process::Stdio;
+
+use anyhow::{anyhow, Context, Result};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStderr, Command};
+
+use super::config::CaptureConfig;
+use super::system_audio;
+
+/// Reads a child's stderr to completion in the background and logs it via
+/// `tracing`. ffmpeg writes continuous progress stats to stderr; without
+/// draining it, the OS pipe buffer fills up and the process blocks trying to
+/// write, silently deadlocking anything awaiting its exit.
+pub fn spawn_stderr_drain(stderr: ChildStderr, label: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => tracing::debug!(target: "ffmpeg", "[{label}] {line}"),
+                _ => break,
+            }
+        }
+    })
+}
+
+/// Spawns a short-lived ffmpeg command (mux/concat passes), drains its
+/// stderr, and waits for it to finish successfully.
+pub async fn run_to_completion(mut cmd: Command, label: &str) -> Result<()> {
+    let mut child: Child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn ffmpeg ({label})"))?;
+    let drain = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_stderr_drain(stderr, label.to_string()));
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("ffmpeg ({label}) wait failed"))?;
+    if let Some(handle) = drain {
+        let _ = handle.await;
+    }
+    if !status.success() {
+        return Err(anyhow!("ffmpeg ({label}) exited with status {status}"));
+    }
+    Ok(())
+}
+
+/// Builds the ffmpeg process that records one segment: desktop video via
+/// gdigrab, plus the microphone via dshow if enabled. System audio is
+/// captured separately (see `system_audio.rs`, WASAPI has no ffmpeg/dshow
+/// path on stock Windows) and muxed in afterwards by `build_mux_command`.
+///
+/// `+frag_keyframe+empty_moov` makes the mp4 playable even if the process is
+/// killed instead of stopped gracefully — segment boundaries (pause/resume)
+/// must never corrupt already-recorded footage.
+#[cfg(target_os = "windows")]
+pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-f")
+        .arg("gdigrab")
+        .arg("-framerate")
+        .arg(config.framerate.to_string())
+        .arg("-i")
+        .arg("desktop");
+
+    if config.capture_microphone {
+        let mic = config.microphone_device.as_deref().unwrap_or("default");
+        cmd.arg("-f")
+            .arg("dshow")
+            .arg("-i")
+            .arg(format!("audio={mic}"));
+    }
+
+    cmd.arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("ultrafast")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+frag_keyframe+empty_moov");
+
+    if config.capture_microphone {
+        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k");
+    }
+
+    cmd.arg(output_path);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn build_segment_command(_config: &CaptureConfig, _output_path: &Path) -> Command {
+    unimplemented!(
+        "screen capture is only implemented for Windows in this prototype (Week 1 milestone scope, see roadmap in screen-recorder-spec.md)"
+    )
+}
+
+/// Muxes a recorded segment with its separately-captured system-audio track
+/// (raw interleaved f32le PCM, see `system_audio.rs`). If the segment has no
+/// microphone track, the loopback audio becomes the sole audio track;
+/// otherwise the two are mixed together.
+pub fn build_mux_command(
+    segment_video_path: &Path,
+    loopback_pcm_path: &Path,
+    has_mic_track: bool,
+    output_path: &Path,
+) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(segment_video_path)
+        .arg("-f")
+        .arg("f32le")
+        .arg("-ar")
+        .arg(system_audio::SAMPLE_RATE.to_string())
+        .arg("-ac")
+        .arg(system_audio::CHANNELS.to_string())
+        .arg("-i")
+        .arg(loopback_pcm_path);
+
+    if has_mic_track {
+        cmd.arg("-filter_complex")
+            .arg("[0:a][1:a]amix=inputs=2:duration=longest[aout]")
+            .arg("-map")
+            .arg("0:v")
+            .arg("-map")
+            .arg("[aout]");
+    } else {
+        cmd.arg("-map").arg("0:v").arg("-map").arg("1:a");
+    }
+
+    cmd.arg("-c:v")
+        .arg("copy")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("160k")
+        .arg(output_path);
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Concatenates finalized segments (already muxed with all their audio) into
+/// the final recording, via ffmpeg's concat demuxer with stream copy.
+pub fn build_concat_command(list_file: &Path, output_path: &Path) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(list_file)
+        .arg("-c")
+        .arg("copy")
+        .arg(output_path);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Writes the file list consumed by `build_concat_command`. ffmpeg's concat
+/// demuxer expects `file '<path>'` lines with single quotes escaped.
+pub fn write_concat_list(segment_paths: &[std::path::PathBuf], list_path: &Path) -> Result<()> {
+    let mut contents = String::new();
+    for path in segment_paths {
+        let escaped = path.to_string_lossy().replace('\'', "'\\''");
+        contents.push_str(&format!("file '{escaped}'\n"));
+    }
+    std::fs::write(list_path, contents)
+        .with_context(|| format!("failed to write concat list at {list_path:?}"))?;
+    Ok(())
+}
+
+/// Enumerates dshow audio input device names (microphones) by parsing
+/// ffmpeg's `-list_devices` stderr output. Used to populate the microphone
+/// picker instead of hardcoding a device name.
+#[cfg(target_os = "windows")]
+pub async fn list_microphones() -> Result<Vec<String>> {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to run ffmpeg -list_devices")?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut devices = Vec::new();
+    for line in stderr.lines() {
+        if let Some(rest) = line.trim().strip_prefix('"') {
+            if line.contains("(audio)") {
+                if let Some(end) = rest.find('"') {
+                    devices.push(rest[..end].to_string());
+                }
+            }
+        }
+    }
+    Ok(devices)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn list_microphones() -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
