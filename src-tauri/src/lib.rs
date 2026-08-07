@@ -5,6 +5,7 @@ mod llm;
 mod pipeline;
 mod state;
 mod subtitle;
+mod thermal;
 
 use tauri::Manager;
 
@@ -49,6 +50,7 @@ pub fn run() {
                 recordings_dir: tokio::sync::Mutex::new(recordings_dir),
                 db,
                 job_tx,
+                translation_controls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             });
             Ok(())
         })
@@ -73,6 +75,9 @@ pub fn run() {
             commands::generate_summary,
             commands::get_summary,
             commands::translate_subtitles,
+            commands::pause_translation,
+            commands::resume_translation,
+            commands::cancel_translation,
             commands::get_stt_settings,
             commands::set_stt_settings,
         ])

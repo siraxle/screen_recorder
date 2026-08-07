@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
 use crate::capture::CaptureController;
 use crate::db::SharedConn;
-use crate::pipeline::JobSender;
+use crate::pipeline::{JobSender, TranslationControl};
 
 /// Recording state is a single optional controller: this prototype supports
 /// one active recording at a time, matching the F1 acceptance criteria
@@ -18,4 +20,8 @@ pub struct AppState {
     pub recordings_dir: Mutex<PathBuf>,
     pub db: SharedConn,
     pub job_tx: JobSender,
+    /// One entry per in-flight `translate` job, keyed by recording id --
+    /// see `pipeline::TranslationControl` and `commands::pause_translation`/
+    /// `resume_translation`/`cancel_translation`.
+    pub translation_controls: Mutex<HashMap<String, Arc<TranslationControl>>>,
 }

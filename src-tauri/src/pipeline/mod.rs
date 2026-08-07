@@ -4,16 +4,65 @@
 
 pub mod stt;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use anyhow::Result;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
 use crate::capture::ffmpeg;
 use crate::db::{self, PipelineStatus, SharedConn, Summary};
 use crate::llm;
+use crate::state::AppState;
 
 pub type JobSender = mpsc::UnboundedSender<String>;
+
+/// Lets the UI pause/resume or cancel an in-flight `translate` job (F8) from
+/// outside the job queue -- see `commands::pause_translation`,
+/// `resume_translation`, `cancel_translation`. Registered in
+/// `AppState::translation_controls`, keyed by recording id, for the
+/// duration of `process_translate_job`; at most one is ever actually
+/// driving an LLM call at a time (`spawn_queue_worker`'s single-worker
+/// queue), but keying by recording id rather than a single global slot
+/// keeps a stale pause/cancel click from ever hitting the wrong job.
+#[derive(Default)]
+pub struct TranslationControl {
+    paused: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+impl TranslationControl {
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Polls every 300ms while paused. A plain poll rather than a
+    /// `Notify`-based wakeup: `pause`/`resume`/`cancel` come from a Tauri
+    /// command handler that has no reference to whatever waiter this task
+    /// may or may not currently have registered, so a `Notify::notify_*`
+    /// call could easily land in the gap between this loop checking
+    /// `paused` and starting to wait, and be lost -- a 300ms poll can't
+    /// miss a flag flip, and is cheap enough for a UI-driven pause.
+    async fn wait_if_paused(&self) {
+        while self.paused.load(Ordering::SeqCst) && !self.cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+}
 
 /// Payload for the `transcription-progress` event, emitted as
 /// `pipeline::stt::transcribe` reports progress fractions. Pushed
@@ -55,6 +104,61 @@ struct TranslationUpdate {
     failed_segments: usize,
     total_segments: usize,
     message: Option<String>,
+}
+
+/// Emitted while a `translate`/`summarize` job is paused by
+/// `thermal::wait_for_safe_temp`, so the UI can show "GPU cooling down"
+/// instead of the job looking hung.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThermalCooldown {
+    recording_id: String,
+    gpu_temp_c: u32,
+}
+
+/// Builds the `on_cooldown` callback `run_translation`/`run_summarization`
+/// call while paused for heat -- see `thermal::wait_for_safe_temp`.
+fn make_cooldown_emitter(
+    app_handle: &AppHandle,
+    recording_id: &str,
+) -> impl Fn(u32) + Send + Sync {
+    let app_handle = app_handle.clone();
+    let recording_id = recording_id.to_string();
+    move |gpu_temp_c: u32| {
+        let _ = app_handle.emit(
+            "thermal-cooldown",
+            ThermalCooldown { recording_id: recording_id.clone(), gpu_temp_c },
+        );
+    }
+}
+
+/// Payload for the `translation-progress` event: `run_translation` has no
+/// per-stage DB status to piggyback on (see `TranslationUpdate`'s doc
+/// comment), and segment-by-segment LLM calls can take long enough --
+/// especially with `thermal::wait_for_safe_temp` pausing them -- that the UI
+/// needs its own sense of "how far in" beyond a bare "Translating..." label.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationProgress {
+    recording_id: String,
+    /// 0.0..=1.0
+    progress: f64,
+}
+
+/// Builds the `on_progress` callback `run_translation` calls after each
+/// segment.
+fn make_translation_progress_emitter(
+    app_handle: &AppHandle,
+    recording_id: &str,
+) -> impl Fn(f64) + Send + Sync {
+    let app_handle = app_handle.clone();
+    let recording_id = recording_id.to_string();
+    move |progress: f64| {
+        let _ = app_handle.emit(
+            "translation-progress",
+            TranslationProgress { recording_id: recording_id.clone(), progress },
+        );
+    }
 }
 
 /// Spawns the single background worker that drains the job queue. One
@@ -131,7 +235,10 @@ async fn process_job(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> R
     emit_update(app_handle, db, &recording_id).await;
 
     let result = match job.stage.as_str() {
-        "summarize" => run_summarization(db, &recording_id).await,
+        "summarize" => {
+            run_summarization(db, &recording_id, &make_cooldown_emitter(app_handle, &recording_id))
+                .await
+        }
         _ => {
             let progress_handle = app_handle.clone();
             let progress_recording_id = recording_id.clone();
@@ -243,7 +350,11 @@ async fn run_transcription(
 /// LLM provider for a JSON summary, and persists the result. Target
 /// language is the user's explicit summary-language override if set,
 /// otherwise the transcript's detected language (spec's language default).
-async fn run_summarization(db: &SharedConn, recording_id: &str) -> Result<()> {
+async fn run_summarization(
+    db: &SharedConn,
+    recording_id: &str,
+    on_cooldown: &(dyn Fn(u32) + Send + Sync),
+) -> Result<()> {
     let segments = {
         let rid = recording_id.to_string();
         db::with_db(db, move |conn| db::get_transcript_segments(conn, &rid)).await?
@@ -285,6 +396,9 @@ async fn run_summarization(db: &SharedConn, recording_id: &str) -> Result<()> {
          of the transcript's language."
     );
 
+    if settings.provider == llm::ProviderKind::Local {
+        crate::thermal::wait_for_safe_temp(on_cooldown).await;
+    }
     let reply =
         llm::complete(&settings, cloud_token.as_deref(), &system_prompt, &transcript_text).await?;
     let parsed = llm::parse_summary_reply(&reply);
@@ -333,9 +447,49 @@ async fn process_translate_job(
             .ok_or_else(|| anyhow::anyhow!("no subtitle language set for translation"))?
     };
 
-    let outcome = run_translation(db, &recording_id, &target_language).await;
+    // Registered for the duration of this job so `commands::pause_translation`
+    // /`resume_translation`/`cancel_translation` can reach it -- removed in
+    // the `finally`-style cleanup below regardless of outcome, so a stale
+    // entry never lingers for a job that already finished.
+    let control = std::sync::Arc::new(TranslationControl::default());
+    {
+        let state = app_handle.state::<AppState>();
+        let mut controls = state.translation_controls.lock().await;
+        controls.insert(recording_id.clone(), control.clone());
+    }
+
+    let outcome = run_translation(
+        db,
+        &recording_id,
+        &target_language,
+        &make_cooldown_emitter(app_handle, &recording_id),
+        &make_translation_progress_emitter(app_handle, &recording_id),
+        &control,
+    )
+    .await;
+
+    {
+        let state = app_handle.state::<AppState>();
+        let mut controls = state.translation_controls.lock().await;
+        controls.remove(&recording_id);
+    }
 
     let event = match &outcome {
+        Ok(o) if o.cancelled => {
+            let job_id = job.id.clone();
+            db::with_db(db, move |conn| {
+                db::set_job_failed(conn, &job_id, "cancelled by user")
+            })
+            .await?;
+            TranslationUpdate {
+                recording_id: recording_id.clone(),
+                language: target_language.clone(),
+                status: "cancelled",
+                failed_segments: 0,
+                total_segments: 0,
+                message: None,
+            }
+        }
         Ok(o) => {
             let job_id = job.id.clone();
             db::with_db(db, move |conn| db::set_job_done(conn, &job_id)).await?;
@@ -370,6 +524,10 @@ async fn process_translate_job(
 struct TranslationOutcome {
     failed_segments: usize,
     total_segments: usize,
+    /// Set when `TranslationControl::cancel` fired mid-loop -- see
+    /// `run_translation`'s early return, which discards any segments
+    /// translated so far rather than persisting a partial result.
+    cancelled: bool,
 }
 
 /// F8: translates the persisted transcript segment-by-segment, preserving
@@ -382,6 +540,9 @@ async fn run_translation(
     db: &SharedConn,
     recording_id: &str,
     target_language: &str,
+    on_cooldown: &(dyn Fn(u32) + Send + Sync),
+    on_progress: &(dyn Fn(f64) + Send + Sync),
+    control: &TranslationControl,
 ) -> Result<TranslationOutcome> {
     let segments = {
         let rid = recording_id.to_string();
@@ -405,7 +566,18 @@ async fn run_translation(
     let total_segments = segments.len();
     let mut translated = Vec::with_capacity(total_segments);
     let mut failed_segments = 0usize;
-    for segment in &segments {
+    for (i, segment) in segments.iter().enumerate() {
+        control.wait_if_paused().await;
+        if control.is_cancelled() {
+            return Ok(TranslationOutcome {
+                failed_segments,
+                total_segments,
+                cancelled: true,
+            });
+        }
+        if settings.provider == llm::ProviderKind::Local {
+            crate::thermal::wait_for_safe_temp(on_cooldown).await;
+        }
         match llm::translate_segment(
             &settings,
             cloud_token.as_deref(),
@@ -426,6 +598,7 @@ async fn run_translation(
                 translated.push(segment.clone());
             }
         }
+        on_progress((i + 1) as f64 / total_segments as f64);
     }
 
     {
@@ -437,7 +610,7 @@ async fn run_translation(
         .await?;
     }
 
-    Ok(TranslationOutcome { failed_segments, total_segments })
+    Ok(TranslationOutcome { failed_segments, total_segments, cancelled: false })
 }
 
 async fn emit_update(app_handle: &AppHandle, db: &SharedConn, recording_id: &str) {
@@ -451,6 +624,14 @@ async fn emit_update(app_handle: &AppHandle, db: &SharedConn, recording_id: &str
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A no-op `on_cooldown` callback for tests that don't exercise the
+    /// thermal-pause path (see `thermal::wait_for_safe_temp`).
+    fn no_cooldown(_gpu_temp_c: u32) {}
+
+    /// A no-op `on_progress` callback for tests that don't assert on
+    /// translation progress events.
+    fn no_progress(_progress: f64) {}
 
     /// Real (non-mocked) integration test of the queue-independent part of
     /// the pipeline (db + ffmpeg wav extraction + the real whisper worker):
@@ -577,7 +758,7 @@ mod tests {
             .unwrap();
         }
 
-        run_summarization(&db, &recording_id)
+        run_summarization(&db, &recording_id, &no_cooldown)
             .await
             .expect("summarization should succeed");
 
@@ -664,7 +845,14 @@ mod tests {
             .unwrap();
         }
 
-        let outcome = run_translation(&db, &recording_id, "fr")
+        let outcome = run_translation(
+            &db,
+            &recording_id,
+            "fr",
+            &no_cooldown,
+            &no_progress,
+            &TranslationControl::default(),
+        )
             .await
             .expect("translation should succeed");
         assert_eq!(outcome.failed_segments, 0);
@@ -737,7 +925,14 @@ mod tests {
             .unwrap();
         }
 
-        let outcome = run_translation(&db, &recording_id, "fr")
+        let outcome = run_translation(
+            &db,
+            &recording_id,
+            "fr",
+            &no_cooldown,
+            &no_progress,
+            &TranslationControl::default(),
+        )
             .await
             .expect("job should still complete despite a failed segment");
         assert_eq!(outcome.failed_segments, 1);

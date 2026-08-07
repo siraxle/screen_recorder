@@ -487,6 +487,43 @@ pub async fn translate_subtitles(
     Ok(())
 }
 
+/// Pauses an in-flight `translate` job (F8) between segments -- a no-op if
+/// no `translate` job is currently running for this recording (already
+/// finished, or never started), matching this app's other idempotent
+/// UI-triggered commands (e.g. `clear_cloud_api_token`).
+#[tauri::command]
+pub async fn pause_translation(state: State<'_, AppState>, recording_id: String) -> Result<(), String> {
+    let controls = state.translation_controls.lock().await;
+    if let Some(control) = controls.get(&recording_id) {
+        control.pause();
+    }
+    Ok(())
+}
+
+/// Resumes a `translate` job paused via `pause_translation`.
+#[tauri::command]
+pub async fn resume_translation(state: State<'_, AppState>, recording_id: String) -> Result<(), String> {
+    let controls = state.translation_controls.lock().await;
+    if let Some(control) = controls.get(&recording_id) {
+        control.resume();
+    }
+    Ok(())
+}
+
+/// Cancels an in-flight `translate` job. Any segments already translated in
+/// this run are discarded rather than partially persisted -- see
+/// `pipeline::run_translation`'s early return on cancellation -- so the
+/// recording is left exactly as if `translate_subtitles` had never been
+/// called for this language, and the user can just start over.
+#[tauri::command]
+pub async fn cancel_translation(state: State<'_, AppState>, recording_id: String) -> Result<(), String> {
+    let controls = state.translation_controls.lock().await;
+    if let Some(control) = controls.get(&recording_id) {
+        control.cancel();
+    }
+    Ok(())
+}
+
 /// The STT engine choice — Whisper (99+ languages, auto-detect) vs. NVIDIA
 /// Parakeet-TDT-0.6B-v3 (faster, ~25 languages, no auto-detect) — is a global
 /// setting read at `transcribe` job run time, mirroring `get_llm_settings`.

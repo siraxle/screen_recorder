@@ -69,10 +69,20 @@ interface JobFailed {
   message: string;
 }
 
+interface ThermalCooldown {
+  recordingId: string;
+  gpuTempC: number;
+}
+
+interface TranslationProgress {
+  recordingId: string;
+  progress: number; // 0.0..=1.0
+}
+
 interface TranslationUpdate {
   recordingId: string;
   language: string;
-  status: "done" | "failed";
+  status: "done" | "failed" | "cancelled";
   failedSegments: number;
   totalSegments: number;
   message: string | null;
@@ -206,8 +216,12 @@ function App() {
   const [dualSubtitles, setDualSubtitles] = useState(false);
   const [separateSubtitleFiles, setSeparateSubtitleFiles] = useState(false);
   const [translating, setTranslating] = useState(false);
+  const [translationPaused, setTranslationPaused] = useState(false);
+  const [translationProgress, setTranslationProgress] = useState<number | null>(null);
   const [translationInfo, setTranslationInfo] = useState<string | null>(null);
   const [translatedLanguages, setTranslatedLanguages] = useState<Set<string>>(new Set());
+  const [cooldown, setCooldown] = useState<ThermalCooldown | null>(null);
+  const cooldownTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     invoke<string[]>("list_microphones")
@@ -268,6 +282,7 @@ function App() {
       if (event.payload.id === recordingIdRef.current) {
         setPipeline(event.payload);
         setTranscriptionProgress(event.payload.status === "transcribing" ? 0 : null);
+        if (event.payload.status !== "summarizing") setCooldown(null);
       }
       setRecordings((prev) => {
         const next = prev.filter((r) => r.id !== event.payload.id);
@@ -296,6 +311,36 @@ function App() {
     const unlisten = listen<JobFailed>("job-failed", (event) => {
       if (event.payload.recordingId === recordingIdRef.current) {
         setError(`${event.payload.stage} failed: ${event.payload.message}`);
+        setCooldown(null);
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  // Backend polls the GPU every 5s while a local-LLM job (translate/summarize)
+  // is paused for heat and re-emits this event each tick (see
+  // thermal::wait_for_safe_temp) — there's no separate "resumed" event, so
+  // clearing the banner on a timeout (a couple of ticks' worth) covers the
+  // case where the temp drops and the job just continues silently.
+  useEffect(() => {
+    const unlisten = listen<ThermalCooldown>("thermal-cooldown", (event) => {
+      if (event.payload.recordingId !== recordingIdRef.current) return;
+      setCooldown(event.payload);
+      if (cooldownTimeoutRef.current !== null) window.clearTimeout(cooldownTimeoutRef.current);
+      cooldownTimeoutRef.current = window.setTimeout(() => setCooldown(null), 12_000);
+    });
+    return () => {
+      unlisten.then((f) => f());
+      if (cooldownTimeoutRef.current !== null) window.clearTimeout(cooldownTimeoutRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<TranslationProgress>("translation-progress", (event) => {
+      if (event.payload.recordingId === recordingIdRef.current) {
+        setTranslationProgress(event.payload.progress);
       }
     });
     return () => {
@@ -307,6 +352,9 @@ function App() {
     const unlisten = listen<TranslationUpdate>("translation-updated", (event) => {
       if (event.payload.recordingId !== recordingIdRef.current) return;
       setTranslating(false);
+      setTranslationPaused(false);
+      setTranslationProgress(null);
+      setCooldown(null);
       if (event.payload.status === "done") {
         setTranslatedLanguages((prev) => new Set(prev).add(event.payload.language));
         setTranslationInfo(
@@ -314,6 +362,8 @@ function App() {
             ? `Translated to ${event.payload.language} — ${event.payload.failedSegments} of ${event.payload.totalSegments} segments kept the original text (translation failed for those).`
             : `Translated to ${event.payload.language}.`
         );
+      } else if (event.payload.status === "cancelled") {
+        setTranslationInfo("Translation stopped.");
       } else {
         setTranslationInfo(`Translation failed: ${event.payload.message ?? "unknown error"}`);
       }
@@ -425,13 +475,37 @@ function App() {
     const targetLanguage = resolveSubtitleLanguage();
     if (!targetLanguage) return;
     setTranslating(true);
+    setTranslationPaused(false);
+    setTranslationProgress(0);
     setTranslationInfo(null);
     try {
       await invoke("translate_subtitles", { recordingId: pipeline.id, targetLanguage });
     } catch (e) {
       setTranslating(false);
+      setTranslationProgress(null);
       setError(String(e));
     }
+  }
+
+  async function handlePauseTranslation() {
+    if (!pipeline) return;
+    await run(() => invoke("pause_translation", { recordingId: pipeline.id }));
+    setTranslationPaused(true);
+  }
+
+  async function handleResumeTranslation() {
+    if (!pipeline) return;
+    await run(() => invoke("resume_translation", { recordingId: pipeline.id }));
+    setTranslationPaused(false);
+  }
+
+  async function handleStopTranslation() {
+    if (!pipeline) return;
+    // Backend discards whatever's already translated in this run rather than
+    // persisting a partial result (see pipeline::run_translation) -- the
+    // `translation-updated` "cancelled" event resets `translating` etc. once
+    // the in-flight segment call finishes, so no local state reset here.
+    await run(() => invoke("cancel_translation", { recordingId: pipeline.id }));
   }
 
   async function handleStart() {
@@ -441,6 +515,10 @@ function App() {
     setSummary(null);
     setTranslatedLanguages(new Set());
     setTranslationInfo(null);
+    setTranslating(false);
+    setTranslationPaused(false);
+    setTranslationProgress(null);
+    setCooldown(null);
     recordingIdRef.current = null;
     const config: CaptureConfig = {
       captureSystemAudio,
@@ -492,6 +570,10 @@ function App() {
     setSummary(null);
     setTranslatedLanguages(new Set());
     setTranslationInfo(null);
+    setTranslating(false);
+    setTranslationPaused(false);
+    setTranslationProgress(null);
+    setCooldown(null);
   }
 
   async function handleChangeRecordingsDir() {
@@ -790,6 +872,12 @@ function App() {
             Transcription: <strong>{PIPELINE_LABEL[pipeline.status]}</strong>
             {pipeline.detectedLanguage && ` (${pipeline.detectedLanguage})`}
           </p>
+          {cooldown && (
+            <p className="warning">
+              GPU at {cooldown.gpuTempC}°C — pausing local LLM inference until it cools down
+              (resumes below 80°C).
+            </p>
+          )}
           {pipeline.status === "transcribing" && (
             <div className="progress-bar">
               <div
@@ -854,9 +942,40 @@ function App() {
                       Export as separate files (original.&lt;lang&gt; + translated.&lt;lang&gt;)
                     </label>
                   )}
-                  <button disabled={busy || translating} onClick={handleTranslate}>
-                    {translating ? "Translating…" : "Translate"}
-                  </button>
+                  <div className="controls">
+                    <button disabled={busy || translating} onClick={handleTranslate}>
+                      {translating ? "Translating…" : "Translate"}
+                    </button>
+                    {translating && (
+                      <>
+                        <button
+                          disabled={busy}
+                          onClick={translationPaused ? handleResumeTranslation : handlePauseTranslation}
+                        >
+                          {translationPaused ? "Resume" : "Pause"}
+                        </button>
+                        <button disabled={busy} onClick={handleStopTranslation}>
+                          Stop
+                        </button>
+                      </>
+                    )}
+                  </div>
+                  {translationPaused && <p className="output">Paused.</p>}
+                  {translating && translationProgress !== null && (
+                    <div className="progress-bar">
+                      <div
+                        className="progress-bar-fill"
+                        role="progressbar"
+                        aria-valuenow={Math.round(translationProgress * 100)}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        style={{ "--progress": `${Math.round(translationProgress * 100)}%` } as CSSProperties}
+                      />
+                      <span className="progress-bar-label">
+                        {Math.round(translationProgress * 100)}%
+                      </span>
+                    </div>
+                  )}
                   {translationInfo && <p className="output">{translationInfo}</p>}
                 </>
               )}
