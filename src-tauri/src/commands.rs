@@ -213,6 +213,53 @@ pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<Recording
         .map_err(|e| e.to_string())
 }
 
+/// Empty/whitespace-only titles are normalized to `None` so clearing the
+/// rename field falls back to the UI's default display (formatted date)
+/// instead of persisting an empty string.
+#[tauri::command]
+pub async fn rename_recording(
+    state: State<'_, AppState>,
+    recording_id: String,
+    title: Option<String>,
+) -> Result<(), String> {
+    let title = title.and_then(|t| {
+        let trimmed = t.trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    });
+    db::with_db(&state.db, move |conn| {
+        db::set_recording_title(conn, &recording_id, title.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_recording(
+    state: State<'_, AppState>,
+    recording_id: String,
+) -> Result<(), String> {
+    let video_path = db::with_db(&state.db, move |conn| db::delete_recording(conn, &recording_id))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Best-effort: the DB rows are already gone (the source of truth for
+    // "is this recording deleted"), so a missing/locked folder here isn't
+    // reported back as a failure.
+    if let Some(folder) = video_path.parent() {
+        let _ = std::fs::remove_dir_all(folder);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn search_recordings(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<db::SearchResult>, String> {
+    db::with_db(&state.db, move |conn| db::search_recordings(conn, &query))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn get_transcript(
     state: State<'_, AppState>,

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type RecordingStatus = "recording" | "paused" | "stopped";
@@ -51,6 +52,7 @@ interface RecordingSummary {
   status: PipelineStatus;
   detectedLanguage: string | null;
   durationMs: number | null;
+  title: string | null;
 }
 
 interface StopRecordingResult {
@@ -95,6 +97,17 @@ interface ExportSubtitlesResult {
 interface TranslationStateResult {
   languages: string[];
   inProgress: boolean;
+}
+
+interface SearchMatch {
+  source: "transcript" | "summary";
+  snippet: string;
+  startMs: number | null;
+}
+
+interface SearchResult {
+  recording: RecordingSummary;
+  matches: SearchMatch[];
 }
 
 interface LiveSubtitlesSettings {
@@ -182,11 +195,39 @@ function formatDuration(durationMs: number | null): string {
     : `${minutes}:${pad(seconds)}`;
 }
 
+function formatTimecode(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+const SNIPPET_MARK_START = "\u0001";
+const SNIPPET_MARK_END = "\u0002";
+
+// Splits a search snippet on the backend's highlight markers into plain
+// text and <mark> spans, rather than trusting dangerouslySetInnerHTML with
+// transcript/summary text the app doesn't control.
+function renderSnippet(snippet: string): ReactNode[] {
+  const parts = snippet.split(SNIPPET_MARK_START);
+  const nodes: ReactNode[] = [parts[0]];
+  for (let i = 1; i < parts.length; i++) {
+    const [marked, ...rest] = parts[i].split(SNIPPET_MARK_END);
+    nodes.push(<mark key={i}>{marked}</mark>);
+    nodes.push(rest.join(SNIPPET_MARK_END));
+  }
+  return nodes;
+}
+
 function formatCreatedAt(createdAt: string): string {
   if (!createdAt) return "—";
   const date = new Date(createdAt);
   if (Number.isNaN(date.getTime())) return createdAt;
   return date.toLocaleString();
+}
+
+function displayName(recording: RecordingSummary): string {
+  return recording.title || formatCreatedAt(recording.createdAt);
 }
 
 const DEFAULT_LLM_SETTINGS: LlmSettingsResponse = {
@@ -211,10 +252,17 @@ function App() {
 
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [pipeline, setPipeline] = useState<RecordingSummary | null>(null);
+  const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState<string>("");
+  const [renaming, setRenaming] = useState(false);
   const [transcriptionProgress, setTranscriptionProgress] = useState<number | null>(null);
   const [exportedPaths, setExportedPaths] = useState<string[] | null>(null);
   const [recordingsDir, setRecordingsDir] = useState<string>("");
   const recordingIdRef = useRef<string | null>(null);
+
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
+  const [searching, setSearching] = useState(false);
 
   const [llmSettings, setLlmSettings] = useState<LlmSettingsResponse>(DEFAULT_LLM_SETTINGS);
   const [cloudTokenInput, setCloudTokenInput] = useState<string>("");
@@ -296,6 +344,26 @@ function App() {
   useEffect(() => {
     refreshRecordings();
   }, []);
+
+  // Debounced live search (F11): re-queries 300ms after the user stops
+  // typing rather than on every keystroke, and clears results (rather than
+  // showing an empty-results state) once the box is emptied.
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed) {
+      setSearchResults(null);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    const handle = setTimeout(() => {
+      invoke<SearchResult[]>("search_recordings", { query: trimmed })
+        .then(setSearchResults)
+        .catch((e) => setError(String(e)))
+        .finally(() => setSearching(false));
+    }, 300);
+    return () => clearTimeout(handle);
+  }, [searchQuery]);
 
   useEffect(() => {
     if (pipeline?.status !== "summarized" || !recordingIdRef.current) return;
@@ -640,6 +708,7 @@ function App() {
         status: "recorded",
         detectedLanguage: null,
         durationMs: null,
+        title: null,
       });
       setTranscriptionProgress(null);
       refreshRecordings();
@@ -658,6 +727,68 @@ function App() {
     setTranslationPaused(false);
     setTranslationProgress(null);
     setCooldown(null);
+  }
+
+  function startEditingTitle(recording: RecordingSummary) {
+    setEditingTitleId(recording.id);
+    setEditingTitle(recording.title ?? "");
+  }
+
+  function cancelEditingTitle() {
+    setEditingTitleId(null);
+    setEditingTitle("");
+  }
+
+  async function handleRenameRecording(recording: RecordingSummary) {
+    const nextTitle = editingTitle.trim() || null;
+    setRenaming(true);
+    setError(null);
+    try {
+      await invoke("rename_recording", { recordingId: recording.id, title: nextTitle });
+      setRecordings((prev) =>
+        prev.map((r) => (r.id === recording.id ? { ...r, title: nextTitle } : r))
+      );
+      setPipeline((prev) => (prev && prev.id === recording.id ? { ...prev, title: nextTitle } : prev));
+      setEditingTitleId(null);
+      setEditingTitle("");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRenaming(false);
+    }
+  }
+
+  async function handleDeleteRecording(recording: RecordingSummary) {
+    const confirmed = window.confirm(
+      `Delete "${displayName(recording)}"? This removes its recording file, transcript, and summary. This cannot be undone.`
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("delete_recording", { recordingId: recording.id });
+      if (pipeline?.id === recording.id) {
+        recordingIdRef.current = null;
+        setPipeline(null);
+      }
+      if (editingTitleId === recording.id) {
+        setEditingTitleId(null);
+        setEditingTitle("");
+      }
+      refreshRecordings();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleOpenRecordingFolder(recording: RecordingSummary) {
+    try {
+      await revealItemInDir(recording.videoPath);
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function handleChangeRecordingsDir() {
@@ -702,14 +833,60 @@ function App() {
 
       <section className="panel">
         <h2>Recordings library</h2>
-        {recordings.length === 0 && <p className="output">No recordings yet.</p>}
-        {recordings.length > 0 && (
+        <label className="checkbox-row path-row">
+          Search transcripts &amp; summaries
+          <input
+            type="text"
+            value={searchQuery}
+            placeholder="e.g. budget, action items…"
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </label>
+        {searching && <p className="output">Searching…</p>}
+        {searchResults !== null && (
+          <div className="search-results">
+            {searchResults.length === 0 && !searching && (
+              <p className="output">No matches for "{searchQuery.trim()}".</p>
+            )}
+            {searchResults.map((result) => (
+              <div
+                key={result.recording.id}
+                className={
+                  "search-result" +
+                  (result.recording.id === pipeline?.id ? " selected" : "")
+                }
+                onClick={() => selectRecording(result.recording)}
+              >
+                <div className="search-result-header">
+                  <strong>{displayName(result.recording)}</strong>
+                  <span>{PIPELINE_LABEL[result.recording.status]}</span>
+                </div>
+                {result.matches.map((match, i) => (
+                  <p key={i} className="search-snippet">
+                    {match.startMs !== null && (
+                      <code>{formatTimecode(match.startMs)}</code>
+                    )}
+                    {match.startMs === null && <code>summary</code>}
+                    {" "}
+                    {renderSnippet(match.snippet)}
+                  </p>
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
+        {searchResults === null && recordings.length === 0 && (
+          <p className="output">No recordings yet.</p>
+        )}
+        {searchResults === null && recordings.length > 0 && (
           <table className="recordings-table">
             <thead>
               <tr>
+                <th>Name</th>
                 <th>Date</th>
                 <th>Duration</th>
                 <th>Status</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -719,11 +896,52 @@ function App() {
                   className={recording.id === pipeline?.id ? "selected" : undefined}
                   onClick={() => selectRecording(recording)}
                 >
+                  <td onClick={(e) => e.stopPropagation()}>
+                    {editingTitleId === recording.id ? (
+                      <span className="row-actions">
+                        <input
+                          type="text"
+                          autoFocus
+                          value={editingTitle}
+                          placeholder={formatCreatedAt(recording.createdAt)}
+                          onChange={(e) => setEditingTitle(e.currentTarget.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") handleRenameRecording(recording);
+                            if (e.key === "Escape") cancelEditingTitle();
+                          }}
+                        />
+                        <button disabled={renaming} onClick={() => handleRenameRecording(recording)}>
+                          Save
+                        </button>
+                        <button disabled={renaming} onClick={cancelEditingTitle}>
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <span className="row-actions">
+                        {displayName(recording)}
+                        <button onClick={() => startEditingTitle(recording)}>Rename</button>
+                      </span>
+                    )}
+                  </td>
                   <td>{formatCreatedAt(recording.createdAt)}</td>
                   <td>{formatDuration(recording.durationMs)}</td>
                   <td>
                     {PIPELINE_LABEL[recording.status]}
                     {recording.detectedLanguage && ` (${recording.detectedLanguage})`}
+                  </td>
+                  <td className="row-actions" onClick={(e) => e.stopPropagation()}>
+                    <button onClick={() => handleOpenRecordingFolder(recording)}>Open folder</button>
+                    <button
+                      disabled={
+                        recording.status === "transcribing" ||
+                        recording.status === "summarizing" ||
+                        (recording.id === pipeline?.id && translating)
+                      }
+                      onClick={() => handleDeleteRecording(recording)}
+                    >
+                      Delete
+                    </button>
                   </td>
                 </tr>
               ))}

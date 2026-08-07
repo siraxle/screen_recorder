@@ -140,6 +140,70 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply migration to user_version 6")?;
     }
+    if version < 7 {
+        // F11: full-text search across transcripts and summaries. Both FTS5
+        // tables are "external content" (they store no text of their own,
+        // just the index) pointing at `transcript_segments`/`summaries`,
+        // which are ordinary rowid tables (a declared composite/TEXT PRIMARY
+        // KEY doesn't turn a table into WITHOUT ROWID) so `content_rowid`
+        // can be the implicit `rowid`. Triggers keep the index in sync with
+        // every insert/update/delete; the bundled SQLite build always
+        // compiles in FTS5 (see libsqlite3-sys build.rs), so no extra Cargo
+        // feature is needed. Upgrading DBs already have rows in the content
+        // tables, so this migration backfills both indexes once.
+        conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE transcript_fts USING fts5(
+                text,
+                content='transcript_segments',
+                content_rowid='rowid'
+            );
+            CREATE TRIGGER transcript_segments_ai AFTER INSERT ON transcript_segments BEGIN
+                INSERT INTO transcript_fts(rowid, text) VALUES (new.rowid, new.text);
+            END;
+            CREATE TRIGGER transcript_segments_ad AFTER DELETE ON transcript_segments BEGIN
+                INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+            END;
+            CREATE TRIGGER transcript_segments_au AFTER UPDATE ON transcript_segments BEGIN
+                INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+                INSERT INTO transcript_fts(rowid, text) VALUES (new.rowid, new.text);
+            END;
+            INSERT INTO transcript_fts(rowid, text) SELECT rowid, text FROM transcript_segments;
+
+            CREATE VIRTUAL TABLE summary_fts USING fts5(
+                overview,
+                key_points,
+                content='summaries',
+                content_rowid='rowid'
+            );
+            CREATE TRIGGER summaries_ai AFTER INSERT ON summaries BEGIN
+                INSERT INTO summary_fts(rowid, overview, key_points) VALUES (new.rowid, new.overview, new.key_points);
+            END;
+            CREATE TRIGGER summaries_ad AFTER DELETE ON summaries BEGIN
+                INSERT INTO summary_fts(summary_fts, rowid, overview, key_points) VALUES('delete', old.rowid, old.overview, old.key_points);
+            END;
+            CREATE TRIGGER summaries_au AFTER UPDATE ON summaries BEGIN
+                INSERT INTO summary_fts(summary_fts, rowid, overview, key_points) VALUES('delete', old.rowid, old.overview, old.key_points);
+                INSERT INTO summary_fts(rowid, overview, key_points) VALUES (new.rowid, new.overview, new.key_points);
+            END;
+            INSERT INTO summary_fts(rowid, overview, key_points) SELECT rowid, overview, key_points FROM summaries;
+
+            PRAGMA user_version = 7;
+            ",
+        )
+        .context("failed to apply migration to user_version 7")?;
+    }
+    if version < 8 {
+        // User-editable display name, independent of `created_at` (the
+        // default shown in the UI when this is unset).
+        conn.execute_batch(
+            "
+            ALTER TABLE recordings ADD COLUMN title TEXT;
+            PRAGMA user_version = 8;
+            ",
+        )
+        .context("failed to apply migration to user_version 8")?;
+    }
     Ok(())
 }
 
@@ -255,6 +319,7 @@ pub struct RecordingSummary {
     pub status: PipelineStatus,
     pub detected_language: Option<String>,
     pub duration_ms: Option<i64>,
+    pub title: Option<String>,
 }
 
 pub struct JobRow {
@@ -498,15 +563,15 @@ pub fn get_recording_video_path(conn: &Connection, recording_id: &str) -> Result
 
 pub fn get_recording_summary(conn: &Connection, recording_id: &str) -> Result<RecordingSummary> {
     conn.query_row(
-        "SELECT id, video_path, created_at, status, detected_language, duration_ms FROM recordings WHERE id = ?1",
+        "SELECT id, video_path, created_at, status, detected_language, duration_ms, title FROM recordings WHERE id = ?1",
         [recording_id],
         |row| {
             let status: String = row.get(3)?;
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, status, row.get::<_, Option<String>>(4)?, row.get::<_, Option<i64>>(5)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, status, row.get::<_, Option<String>>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<String>>(6)?))
         },
     )
     .with_context(|| format!("recording {recording_id} not found"))
-    .and_then(|(id, video_path, created_at, status, detected_language, duration_ms)| {
+    .and_then(|(id, video_path, created_at, status, detected_language, duration_ms, title)| {
         Ok(RecordingSummary {
             id,
             video_path,
@@ -514,13 +579,14 @@ pub fn get_recording_summary(conn: &Connection, recording_id: &str) -> Result<Re
             status: PipelineStatus::parse(&status)?,
             detected_language,
             duration_ms,
+            title,
         })
     })
 }
 
 pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT id, video_path, created_at, status, detected_language, duration_ms
+        "SELECT id, video_path, created_at, status, detected_language, duration_ms, title
          FROM recordings ORDER BY created_at DESC",
     )?;
     let rows = stmt
@@ -532,12 +598,13 @@ pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     rows.into_iter()
-        .map(|(id, video_path, created_at, status, detected_language, duration_ms)| {
+        .map(|(id, video_path, created_at, status, detected_language, duration_ms, title)| {
             Ok(RecordingSummary {
                 id,
                 video_path,
@@ -545,9 +612,45 @@ pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
                 status: PipelineStatus::parse(&status)?,
                 detected_language,
                 duration_ms,
+                title,
             })
         })
         .collect()
+}
+
+/// `None`/empty clears the custom title, falling back to the UI's default
+/// display (formatted `created_at`).
+pub fn set_recording_title(
+    conn: &Connection,
+    recording_id: &str,
+    title: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recordings SET title = ?1 WHERE id = ?2",
+        rusqlite::params![title, recording_id],
+    )?;
+    Ok(())
+}
+
+/// Deletes a recording and everything derived from it (transcript,
+/// translations, summary, jobs). Returns the recording's `video_path` so the
+/// caller can also remove the on-disk recording folder — each recording
+/// lives in its own folder (see `commands::stop_recording`), so that path's
+/// parent is safe to remove entirely.
+pub fn delete_recording(conn: &Connection, recording_id: &str) -> Result<PathBuf> {
+    let video_path = get_recording_video_path(conn, recording_id)?;
+    conn.execute(
+        "DELETE FROM translated_segments WHERE recording_id = ?1",
+        [recording_id],
+    )?;
+    conn.execute(
+        "DELETE FROM transcript_segments WHERE recording_id = ?1",
+        [recording_id],
+    )?;
+    conn.execute("DELETE FROM summaries WHERE recording_id = ?1", [recording_id])?;
+    conn.execute("DELETE FROM jobs WHERE recording_id = ?1", [recording_id])?;
+    conn.execute("DELETE FROM recordings WHERE id = ?1", [recording_id])?;
+    Ok(video_path)
 }
 
 pub fn replace_transcript_segments(
@@ -706,6 +809,145 @@ pub fn list_translated_languages(conn: &Connection, recording_id: &str) -> Resul
     Ok(rows)
 }
 
+/// One matching passage within a recording (F11). `snippet` wraps each
+/// matched term in `\u{1}...\u{2}` markers rather than HTML so the frontend
+/// can render highlights without `dangerouslySetInnerHTML` on
+/// transcript/summary text the app doesn't control.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchMatch {
+    pub source: String, // "transcript" | "summary"
+    pub snippet: String,
+    pub start_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    pub recording: RecordingSummary,
+    pub matches: Vec<SearchMatch>,
+}
+
+const SNIPPET_MARK_START: &str = "\u{1}";
+const SNIPPET_MARK_END: &str = "\u{2}";
+
+/// Turns free-text user input into an FTS5 `MATCH` expression. Each token is
+/// quoted (with embedded quotes doubled per FTS5's escaping rule) and given
+/// a trailing `*` for prefix matching, then tokens are joined with FTS5's
+/// implicit `AND` -- this way punctuation/operators the user types (`-`,
+/// `"`, `AND`, `:`) are always treated as literal text instead of tripping
+/// FTS5 query syntax errors.
+fn build_match_query(query: &str) -> Option<String> {
+    let parts: Vec<String> = query
+        .split_whitespace()
+        .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// F11: full-text search across transcript segments and summaries. Results
+/// are grouped by recording (at most 3 transcript matches + 1 summary match
+/// each) and ordered most-recent-first, matching `list_recordings` -- bm25
+/// scores from the two separate FTS5 tables aren't on a comparable scale, so
+/// relevance-ranking across sources isn't attempted.
+pub fn search_recordings(conn: &Connection, query: &str) -> Result<Vec<SearchResult>> {
+    let Some(match_expr) = build_match_query(query) else {
+        return Ok(Vec::new());
+    };
+
+    let mut order: Vec<String> = Vec::new();
+    let mut matches: std::collections::HashMap<String, Vec<SearchMatch>> =
+        std::collections::HashMap::new();
+    let mut push_match = |recording_id: String, m: SearchMatch, per_recording_cap: usize| {
+        let entry = matches.entry(recording_id.clone()).or_insert_with(|| {
+            order.push(recording_id.clone());
+            Vec::new()
+        });
+        if entry.iter().filter(|existing| existing.source == m.source).count() < per_recording_cap {
+            entry.push(m);
+        }
+    };
+
+    let mut transcript_stmt = conn.prepare(
+        "SELECT ts.recording_id, ts.start_ms,
+                snippet(transcript_fts, 0, ?2, ?3, '…', 12)
+         FROM transcript_fts
+         JOIN transcript_segments ts ON ts.rowid = transcript_fts.rowid
+         WHERE transcript_fts MATCH ?1
+         ORDER BY rank
+         LIMIT 200",
+    )?;
+    let transcript_rows = transcript_stmt
+        .query_map(
+            rusqlite::params![match_expr, SNIPPET_MARK_START, SNIPPET_MARK_END],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (recording_id, start_ms, snippet) in transcript_rows {
+        push_match(
+            recording_id,
+            SearchMatch { source: "transcript".to_string(), snippet, start_ms: Some(start_ms) },
+            3,
+        );
+    }
+
+    let mut summary_stmt = conn.prepare(
+        "SELECT s.recording_id,
+                snippet(summary_fts, 0, ?2, ?3, '…', 12),
+                snippet(summary_fts, 1, ?2, ?3, '…', 12)
+         FROM summary_fts
+         JOIN summaries s ON s.rowid = summary_fts.rowid
+         WHERE summary_fts MATCH ?1
+         ORDER BY rank
+         LIMIT 100",
+    )?;
+    let summary_rows = summary_stmt
+        .query_map(
+            rusqlite::params![match_expr, SNIPPET_MARK_START, SNIPPET_MARK_END],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (recording_id, overview_snippet, key_points_snippet) in summary_rows {
+        let snippet = if overview_snippet.contains(SNIPPET_MARK_START) {
+            overview_snippet
+        } else {
+            key_points_snippet
+        };
+        push_match(
+            recording_id,
+            SearchMatch { source: "summary".to_string(), snippet, start_ms: None },
+            1,
+        );
+    }
+
+    let mut results: Vec<SearchResult> = order
+        .into_iter()
+        .filter_map(|recording_id| {
+            let recording = get_recording_summary(conn, &recording_id).ok()?;
+            let matches = matches.remove(&recording_id)?;
+            Some(SearchResult { recording, matches })
+        })
+        .collect();
+    results.sort_by(|a, b| b.recording.created_at.cmp(&a.recording.created_at));
+    Ok(results)
+}
+
 /// True if a `translate` job for this recording is already queued or
 /// running -- guards `commands::translate_subtitles` against enqueueing a
 /// second job that would silently redo the same LLM work `run_translation`
@@ -721,4 +963,90 @@ pub fn has_active_translate_job(conn: &Connection, recording_id: &str) -> Result
         )
         .optional()?;
     Ok(found.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn
+    }
+
+    /// F11: a transcript match reports its timecode and highlights the
+    /// matched term; a summary match reports no timecode.
+    #[test]
+    fn search_finds_transcript_and_summary_matches_with_highlighting() {
+        let conn = open_test_db();
+        insert_recording_with_transcribe_job(&conn, "rec-1", Path::new("rec-1.mp4"), None, None)
+            .unwrap();
+        replace_transcript_segments(
+            &conn,
+            "rec-1",
+            &[Segment { start_ms: 1000, end_ms: 2000, text: "let's discuss the budget".into() }],
+        )
+        .unwrap();
+        replace_summary(
+            &conn,
+            "rec-1",
+            &Summary {
+                overview: "Team agreed on the roadmap.".into(),
+                key_points: vec!["Ship by Friday".into()],
+                language: "en".into(),
+            },
+        )
+        .unwrap();
+
+        let budget_hits = search_recordings(&conn, "budget").unwrap();
+        assert_eq!(budget_hits.len(), 1);
+        assert_eq!(budget_hits[0].matches.len(), 1);
+        let m = &budget_hits[0].matches[0];
+        assert_eq!(m.source, "transcript");
+        assert_eq!(m.start_ms, Some(1000));
+        assert!(m.snippet.contains(&format!("{SNIPPET_MARK_START}budget{SNIPPET_MARK_END}")));
+
+        let roadmap_hits = search_recordings(&conn, "roadmap").unwrap();
+        assert_eq!(roadmap_hits.len(), 1);
+        assert_eq!(roadmap_hits[0].matches[0].source, "summary");
+        assert_eq!(roadmap_hits[0].matches[0].start_ms, None);
+
+        assert!(search_recordings(&conn, "nonexistentword").unwrap().is_empty());
+    }
+
+    /// Punctuation/operators a user might type (quotes, FTS5 keywords) must
+    /// not crash `MATCH` -- `build_match_query` quotes every token.
+    #[test]
+    fn search_handles_special_characters_without_error() {
+        let conn = open_test_db();
+        insert_recording_with_transcribe_job(&conn, "rec-1", Path::new("rec-1.mp4"), None, None)
+            .unwrap();
+        replace_transcript_segments(
+            &conn,
+            "rec-1",
+            &[Segment { start_ms: 0, end_ms: 1000, text: "hello world".into() }],
+        )
+        .unwrap();
+
+        assert!(search_recordings(&conn, "OR \"quoted\" -term:foo").is_ok());
+        assert!(search_recordings(&conn, "").unwrap().is_empty());
+    }
+
+    /// Prefix matching: a partial word (as typed by the debounced search
+    /// box mid-keystroke) should still match.
+    #[test]
+    fn search_matches_on_word_prefix() {
+        let conn = open_test_db();
+        insert_recording_with_transcribe_job(&conn, "rec-1", Path::new("rec-1.mp4"), None, None)
+            .unwrap();
+        replace_transcript_segments(
+            &conn,
+            "rec-1",
+            &[Segment { start_ms: 0, end_ms: 1000, text: "quarterly budgeting review".into() }],
+        )
+        .unwrap();
+
+        assert_eq!(search_recordings(&conn, "budg").unwrap().len(), 1);
+    }
 }

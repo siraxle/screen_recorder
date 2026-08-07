@@ -126,6 +126,62 @@ h1 {
   background-color: #d9e4fa;
 }
 
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.recordings-table input[type="text"] {
+  font-size: inherit;
+  padding: 0.15rem 0.3rem;
+}
+
+.search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.search-result {
+  cursor: pointer;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+}
+
+.search-result:hover {
+  background-color: #eee;
+}
+
+.search-result.selected {
+  background-color: #d9e4fa;
+}
+
+.search-result-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85em;
+  margin-bottom: 0.3rem;
+}
+
+.search-snippet {
+  margin: 0.15rem 0;
+  font-size: 0.9em;
+}
+
+.search-snippet code {
+  margin-right: 0.4rem;
+  opacity: 0.7;
+}
+
+.search-snippet mark {
+  background-color: #ffe58a;
+  color: inherit;
+  border-radius: 2px;
+}
+
 .progress-bar {
   display: flex;
   align-items: center;
@@ -230,5 +286,22 @@ button {
 
   .recordings-table tbody tr.selected {
     background-color: #2a3d63;
+  }
+
+  .search-result {
+    border-color: #444;
+  }
+
+  .search-result:hover {
+    background-color: #3a3a3a;
+  }
+
+  .search-result.selected {
+    background-color: #2a3d63;
+  }
+
+  .search-snippet mark {
+    background-color: #6b5a1f;
+    color: #fff;
   }
 }
