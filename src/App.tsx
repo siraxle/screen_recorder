@@ -13,6 +13,11 @@ type PipelineStatus =
   | "failed";
 
 type ProviderKind = "local" | "cloud";
+type SttEngine = "whisper" | "parakeet";
+
+interface SttSettings {
+  engine: SttEngine;
+}
 
 interface LlmSettings {
   provider: ProviderKind;
@@ -87,6 +92,40 @@ const LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
   { code: "other", label: "Other (enter code)" },
 ];
 
+// Parakeet-TDT-0.6B-v3 takes no language hint and never auto-detects (unlike
+// Whisper) — see pipeline/stt.rs's parakeet_command doc comment — so there's
+// no "Auto-detect" entry here, and the list is capped to the model's actual
+// 25 trained languages rather than offering a free-text "Other" that would
+// silently produce poor results.
+const PARAKEET_LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
+  { code: "en", label: "English" },
+  { code: "ru", label: "Russian" },
+  { code: "uk", label: "Ukrainian" },
+  { code: "es", label: "Spanish" },
+  { code: "de", label: "German" },
+  { code: "fr", label: "French" },
+  { code: "it", label: "Italian" },
+  { code: "pt", label: "Portuguese" },
+  { code: "nl", label: "Dutch" },
+  { code: "pl", label: "Polish" },
+  { code: "cs", label: "Czech" },
+  { code: "sk", label: "Slovak" },
+  { code: "sl", label: "Slovenian" },
+  { code: "hr", label: "Croatian" },
+  { code: "hu", label: "Hungarian" },
+  { code: "ro", label: "Romanian" },
+  { code: "bg", label: "Bulgarian" },
+  { code: "el", label: "Greek" },
+  { code: "da", label: "Danish" },
+  { code: "sv", label: "Swedish" },
+  { code: "fi", label: "Finnish" },
+  { code: "et", label: "Estonian" },
+  { code: "lv", label: "Latvian" },
+  { code: "lt", label: "Lithuanian" },
+  { code: "mt", label: "Maltese" },
+];
+const PARAKEET_LANGUAGE_CODES = new Set(PARAKEET_LANGUAGE_OPTIONS.map((o) => o.code));
+
 // F8: subtitle language defaults to "same as video" (no translation), unlike
 // the transcript-language picker's "auto-detect" default — the two settings
 // are deliberately distinct (CLAUDE.md: "never conflate them").
@@ -155,6 +194,9 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<string | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
 
+  const [sttSettings, setSttSettings] = useState<SttSettings>({ engine: "whisper" });
+  const [sttSettingsSaved, setSttSettingsSaved] = useState(false);
+
   const [summaryLanguage, setSummaryLanguage] = useState<string>("");
   const [customSummaryLanguage, setCustomSummaryLanguage] = useState<string>("");
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -187,6 +229,22 @@ function App() {
       .then(setLlmSettings)
       .catch((e) => setError(String(e)));
   }, []);
+
+  useEffect(() => {
+    invoke<SttSettings>("get_stt_settings")
+      .then(setSttSettings)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  // Parakeet has no "Auto-detect"/"Other" entries (see PARAKEET_LANGUAGE_OPTIONS),
+  // so switching engines away from Whisper while either is selected would
+  // leave the transcript-language picker on a value Parakeet can't use.
+  useEffect(() => {
+    if (sttSettings.engine === "parakeet" && !PARAKEET_LANGUAGE_CODES.has(languageOverride)) {
+      setLanguageOverride("en");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sttSettings.engine]);
 
   function refreshRecordings() {
     invoke<RecordingSummary[]>("list_recordings")
@@ -304,6 +362,21 @@ function App() {
     try {
       await invoke("set_llm_settings", { settings });
       setSettingsSaved(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveSttSettings(engine: SttEngine) {
+    setSttSettingsSaved(false);
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("set_stt_settings", { settings: { engine } });
+      setSttSettings({ engine });
+      setSttSettingsSaved(true);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -494,6 +567,29 @@ function App() {
       </section>
 
       <section className="panel">
+        <h2>Speech recognition</h2>
+        <label className="checkbox-row">
+          <input
+            type="radio"
+            name="stt-engine"
+            checked={sttSettings.engine === "whisper"}
+            onChange={() => handleSaveSttSettings("whisper")}
+          />
+          Whisper (faster-whisper) — 99+ languages, auto-detects the spoken language
+        </label>
+        <label className="checkbox-row">
+          <input
+            type="radio"
+            name="stt-engine"
+            checked={sttSettings.engine === "parakeet"}
+            onChange={() => handleSaveSttSettings("parakeet")}
+          />
+          NVIDIA Parakeet-TDT-0.6B-v3 — ~25 languages, much faster, no language auto-detect
+        </label>
+        {sttSettingsSaved && <span className="output"> Saved.</span>}
+      </section>
+
+      <section className="panel">
         <h2>LLM provider</h2>
         <label className="checkbox-row">
           <input
@@ -628,13 +724,21 @@ function App() {
             disabled={status !== "stopped"}
             onChange={(e) => setLanguageOverride(e.currentTarget.value)}
           >
-            {LANGUAGE_OPTIONS.map((option) => (
-              <option key={option.code} value={option.code}>
-                {option.label}
-              </option>
-            ))}
+            {(sttSettings.engine === "parakeet" ? PARAKEET_LANGUAGE_OPTIONS : LANGUAGE_OPTIONS).map(
+              (option) => (
+                <option key={option.code} value={option.code}>
+                  {option.label}
+                </option>
+              )
+            )}
           </select>
         </label>
+        {sttSettings.engine === "parakeet" && (
+          <p className="output">
+            Parakeet doesn't auto-detect the spoken language — pick one so summaries default to
+            the right language.
+          </p>
+        )}
         {languageOverride === "other" && (
           <input
             type="text"

@@ -7,6 +7,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
 use crate::db::{self, RecordingSummary, Segment, Summary};
 use crate::llm::{self, LlmSettings, ProviderKind};
+use crate::pipeline::stt::{self, SttSettings};
 use crate::state::AppState;
 use crate::subtitle;
 
@@ -484,6 +485,26 @@ pub async fn translate_subtitles(
     };
     let _ = state.job_tx.send(job_id);
     Ok(())
+}
+
+/// The STT engine choice — Whisper (99+ languages, auto-detect) vs. NVIDIA
+/// Parakeet-TDT-0.6B-v3 (faster, ~25 languages, no auto-detect) — is a global
+/// setting read at `transcribe` job run time, mirroring `get_llm_settings`.
+#[tauri::command]
+pub async fn get_stt_settings(state: State<'_, AppState>) -> Result<SttSettings, String> {
+    db::with_db(&state.db, |conn| stt::load_settings(conn))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_stt_settings(
+    state: State<'_, AppState>,
+    settings: SttSettings,
+) -> Result<(), String> {
+    db::with_db(&state.db, move |conn| stt::save_settings(conn, &settings))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

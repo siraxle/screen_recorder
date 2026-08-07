@@ -2,13 +2,63 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout, Command};
 
-use crate::db::Segment;
+use crate::db::{self, Segment};
 
 const DEFAULT_MODEL: &str = "small";
+
+/// The two interchangeable STT backends (see CLAUDE.md: "runtime selected by
+/// target hardware — never hardcode one runtime"). Both speak the same
+/// NDJSON worker protocol, so everything downstream of `transcribe` is
+/// engine-agnostic — only which subprocess gets spawned differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttEngine {
+    /// `faster-whisper` (CTranslate2): 99+ languages, auto-detects the
+    /// spoken language per recording.
+    Whisper,
+    /// NVIDIA Parakeet-TDT-0.6B-v3 via the `onnx-asr` runtime: ~25 languages,
+    /// far faster, but the model itself never reports a detected language
+    /// (see `parakeet_command`'s doc comment).
+    Parakeet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SttSettings {
+    pub engine: SttEngine,
+}
+
+impl Default for SttSettings {
+    fn default() -> Self {
+        Self { engine: SttEngine::Whisper }
+    }
+}
+
+const KEY_STT_ENGINE: &str = "stt_engine";
+
+/// Loads STT engine settings from the generic `settings` key/value table,
+/// mirroring `llm::load_settings`'s fallback-to-default convention.
+pub fn load_settings(conn: &Connection) -> Result<SttSettings> {
+    let engine = match db::get_setting(conn, KEY_STT_ENGINE)?.as_deref() {
+        Some("parakeet") => SttEngine::Parakeet,
+        _ => SttEngine::Whisper,
+    };
+    Ok(SttSettings { engine })
+}
+
+pub fn save_settings(conn: &Connection, settings: &SttSettings) -> Result<()> {
+    let engine_str = match settings.engine {
+        SttEngine::Whisper => "whisper",
+        SttEngine::Parakeet => "parakeet",
+    };
+    db::set_setting(conn, KEY_STT_ENGINE, engine_str)?;
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct WorkerSegment {
@@ -42,14 +92,49 @@ pub struct TranscriptionResult {
     pub segments: Vec<Segment>,
 }
 
-fn worker_script_path() -> PathBuf {
+fn python_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR is `<repo>/src-tauri` at compile time, so this
     // resolves correctly regardless of the process's working directory
     // (`cargo tauri dev` vs. a packaged app).
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("python")
-        .join("whisper_worker.py")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("python")
+}
+
+fn whisper_command(wav_path: &Path, language_override: Option<&str>) -> Command {
+    let mut cmd = Command::new("python");
+    cmd.arg(python_dir().join("whisper_worker.py"))
+        .arg("--audio")
+        .arg(wav_path)
+        .arg("--model")
+        .arg(DEFAULT_MODEL)
+        .arg("--device")
+        .arg("cuda")
+        .arg("--compute-type")
+        .arg("float16");
+    if let Some(lang) = language_override {
+        cmd.arg("--language").arg(lang);
+    }
+    cmd
+}
+
+/// Parakeet-TDT-0.6B-v3, run through the `onnx-asr` package rather than
+/// NVIDIA's NeMo toolkit (NeMo is CUDA-only and far heavier; `onnx-asr` runs
+/// the same checkpoint on CPU or CUDA via ONNX Runtime execution providers,
+/// matching this app's per-hardware-swappable-runtime rule). Unlike Whisper,
+/// the model itself takes no language hint and never reports one back — see
+/// `python/parakeet_worker.py`'s doc comment — so `language_override` here is
+/// purely a label for the `language` field the worker echoes back, not a
+/// decoding constraint.
+fn parakeet_command(wav_path: &Path, language_override: Option<&str>) -> Command {
+    let mut cmd = Command::new("python");
+    cmd.arg(python_dir().join("parakeet_worker.py"))
+        .arg("--audio")
+        .arg(wav_path)
+        .arg("--device")
+        .arg("cuda");
+    if let Some(lang) = language_override {
+        cmd.arg("--language").arg(lang);
+    }
+    cmd
 }
 
 /// Reads a child's stderr to completion, logging each line via `tracing` and
@@ -108,35 +193,34 @@ async fn capture_stdout(
     result
 }
 
-/// Spawns `python whisper_worker.py` on the given WAV file and waits for its
-/// final JSON result, reporting progress fractions (0.0..=1.0) via
-/// `on_progress` as segments are produced. `language_override` of `None`
-/// lets the worker auto-detect (native Whisper behavior).
+/// Spawns the worker subprocess for the given engine on the WAV file and
+/// waits for its final JSON result, reporting progress fractions (0.0..=1.0)
+/// via `on_progress` as segments are produced. `language_override` of `None`
+/// lets Whisper auto-detect (native Whisper behavior); Parakeet has no
+/// auto-detect (see `parakeet_command`).
 pub async fn transcribe(
     wav_path: &Path,
     language_override: Option<&str>,
+    engine: SttEngine,
     on_progress: impl Fn(f64) + Send + 'static,
 ) -> Result<TranscriptionResult> {
-    let mut cmd = Command::new("python");
-    cmd.arg(worker_script_path())
-        .arg("--audio")
-        .arg(wav_path)
-        .arg("--model")
-        .arg(DEFAULT_MODEL)
-        .arg("--device")
-        .arg("cuda")
-        .arg("--compute-type")
-        .arg("float16");
-    if let Some(lang) = language_override {
-        cmd.arg("--language").arg(lang);
-    }
+    let mut cmd = match engine {
+        SttEngine::Whisper => whisper_command(wav_path, language_override),
+        SttEngine::Parakeet => parakeet_command(wav_path, language_override),
+    };
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .context("failed to spawn whisper worker (is `python` on PATH with faster-whisper installed?)")?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "failed to spawn {} worker (is `python` on PATH with its dependencies installed?)",
+            match engine {
+                SttEngine::Whisper => "whisper",
+                SttEngine::Parakeet => "parakeet",
+            }
+        )
+    })?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -147,18 +231,18 @@ pub async fn transcribe(
     let stdout_task = tokio::spawn(capture_stdout(stdout, on_progress));
     let stderr_task = tokio::spawn(capture_stderr(stderr));
 
-    let status = child.wait().await.context("whisper worker wait failed")?;
+    let status = child.wait().await.context("stt worker wait failed")?;
     let result = stdout_task.await.context("stdout reader task panicked")?;
     let stderr_output = stderr_task.await.context("stderr reader task panicked")?;
 
     if !status.success() {
         let tail: Vec<&str> = stderr_output.lines().rev().take(20).collect();
         let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-        return Err(anyhow!("whisper worker exited with status {status}: {tail}"));
+        return Err(anyhow!("stt worker exited with status {status}: {tail}"));
     }
 
     let parsed = result.ok_or_else(|| {
-        anyhow!("whisper worker exited successfully but produced no result output")
+        anyhow!("stt worker exited successfully but produced no result output")
     })?;
 
     let segments = parsed
@@ -195,7 +279,7 @@ mod tests {
             .join("sample_en.wav");
         assert!(fixture.exists(), "fixture missing at {fixture:?}");
 
-        let result = transcribe(&fixture, None, |_| {})
+        let result = transcribe(&fixture, None, SttEngine::Whisper, |_| {})
             .await
             .expect("transcription should succeed");
 
@@ -220,7 +304,7 @@ mod tests {
         let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_clone = progress.clone();
 
-        transcribe(&fixture, None, move |p| {
+        transcribe(&fixture, None, SttEngine::Whisper, move |p| {
             progress_clone.lock().unwrap().push(p);
         })
         .await
@@ -247,7 +331,7 @@ mod tests {
             .join("fixtures")
             .join("sample_en.wav");
 
-        let result = transcribe(&fixture, Some("en"), |_| {})
+        let result = transcribe(&fixture, Some("en"), SttEngine::Whisper, |_| {})
             .await
             .expect("transcription should succeed");
 
