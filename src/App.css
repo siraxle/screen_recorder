@@ -72,6 +72,23 @@ h1 {
   font-size: 1.1em;
 }
 
+.live-caption-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.live-caption {
+  width: 100%;
+  margin: 0;
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  background-color: #000000cc;
+  color: #ffffff;
+  font-size: 1.05em;
+}
+
 .error {
   color: #d32f2f;
 }

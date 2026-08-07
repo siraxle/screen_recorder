@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::capture::CaptureController;
 use crate::db::SharedConn;
+use crate::pipeline::live_subtitles::LiveSubtitles;
 use crate::pipeline::{JobSender, TranslationControl};
 
 /// Recording state is a single optional controller: this prototype supports
@@ -13,6 +14,10 @@ use crate::pipeline::{JobSender, TranslationControl};
 /// (start/pause/resume/stop on a single in-progress recording).
 pub struct AppState {
     pub controller: Mutex<Option<CaptureController>>,
+    /// F6 live subtitles: the running resampler/daemon pipeline for the
+    /// current recording, if the feature is enabled and system audio
+    /// capture is on. Same one-at-a-time shape as `controller`.
+    pub live_subtitles: Mutex<Option<LiveSubtitles>>,
     /// Base folder new recordings are saved under; each recording gets its
     /// own subfolder within it (see `commands::stop_recording`). User-
     /// changeable at runtime via `commands::set_recordings_dir`, so it's

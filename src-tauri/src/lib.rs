@@ -47,6 +47,7 @@ pub fn run() {
 
             app.manage(AppState {
                 controller: tokio::sync::Mutex::new(None),
+                live_subtitles: tokio::sync::Mutex::new(None),
                 recordings_dir: tokio::sync::Mutex::new(recordings_dir),
                 db,
                 job_tx,
@@ -81,6 +82,8 @@ pub fn run() {
             commands::cancel_translation,
             commands::get_stt_settings,
             commands::set_stt_settings,
+            commands::get_live_subtitle_settings,
+            commands::set_live_subtitle_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

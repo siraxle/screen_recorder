@@ -2,6 +2,7 @@
 //! must be explicit and persisted so a crash mid-pipeline resumes from the
 //! last completed stage rather than from scratch.
 
+pub mod live_subtitles;
 pub mod stt;
 
 use std::sync::atomic::{AtomicBool, Ordering};

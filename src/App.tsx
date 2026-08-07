@@ -97,6 +97,18 @@ interface TranslationStateResult {
   inProgress: boolean;
 }
 
+interface LiveSubtitlesSettings {
+  enabled: boolean;
+}
+
+interface LiveSubtitleCaption {
+  text: string;
+}
+
+interface LiveSubtitleCooldown {
+  gpuTempC: number;
+}
+
 const LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
   { code: "", label: "Auto-detect" },
   { code: "en", label: "English" },
@@ -212,6 +224,10 @@ function App() {
   const [sttSettings, setSttSettings] = useState<SttSettings>({ engine: "whisper" });
   const [sttSettingsSaved, setSttSettingsSaved] = useState(false);
 
+  const [liveSubtitlesEnabled, setLiveSubtitlesEnabled] = useState(false);
+  const [liveCaption, setLiveCaption] = useState<string>("");
+  const [liveSubtitlesCooldown, setLiveSubtitlesCooldown] = useState(false);
+
   const [summaryLanguage, setSummaryLanguage] = useState<string>("");
   const [customSummaryLanguage, setCustomSummaryLanguage] = useState<string>("");
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -252,6 +268,12 @@ function App() {
   useEffect(() => {
     invoke<SttSettings>("get_stt_settings")
       .then(setSttSettings)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    invoke<LiveSubtitlesSettings>("get_live_subtitle_settings")
+      .then((s) => setLiveSubtitlesEnabled(s.enabled))
       .catch((e) => setError(String(e)));
   }, []);
 
@@ -395,6 +417,29 @@ function App() {
     };
   }, []);
 
+  // No `recordingId` on either event, unlike the ones above: while a
+  // recording is in progress there's no DB recording id yet (one is only
+  // minted in `stop_recording`), and this app only ever has one recording
+  // active at a time, so nothing needs correlating.
+  useEffect(() => {
+    const unlisten = listen<LiveSubtitleCaption>("live-subtitle-caption", (event) => {
+      setLiveCaption(event.payload.text);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<LiveSubtitleCooldown>("live-subtitle-cooldown", () => {
+      setLiveSubtitlesCooldown(true);
+      window.setTimeout(() => setLiveSubtitlesCooldown(false), 12_000);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   async function run<T>(action: () => Promise<T>) {
     setBusy(true);
     setError(null);
@@ -449,6 +494,19 @@ function App() {
       await invoke("set_stt_settings", { settings: { engine } });
       setSttSettings({ engine });
       setSttSettingsSaved(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveLiveSubtitlesSettings(enabled: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("set_live_subtitle_settings", { settings: { enabled } });
+      setLiveSubtitlesEnabled(enabled);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -541,6 +599,8 @@ function App() {
     setTranslationPaused(false);
     setTranslationProgress(null);
     setCooldown(null);
+    setLiveCaption("");
+    setLiveSubtitlesCooldown(false);
     recordingIdRef.current = null;
     const config: CaptureConfig = {
       captureSystemAudio,
@@ -569,6 +629,8 @@ function App() {
   async function handleStop() {
     const result = await run(() => invoke<StopRecordingResult>("stop_recording"));
     setStatus("stopped");
+    setLiveCaption("");
+    setLiveSubtitlesCooldown(false);
     if (result) {
       recordingIdRef.current = result.recordingId;
       setPipeline({
@@ -822,6 +884,22 @@ function App() {
         </label>
 
         <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={liveSubtitlesEnabled}
+            disabled={status !== "stopped" || !captureSystemAudio}
+            onChange={(e) => handleSaveLiveSubtitlesSettings(e.currentTarget.checked)}
+          />
+          Live subtitles (experimental preview during recording, Windows + system audio only)
+        </label>
+        {liveSubtitlesEnabled && !captureSystemAudio && (
+          <p className="output">
+            Live subtitles need "System audio" enabled above — they won't run this
+            session until it is.
+          </p>
+        )}
+
+        <label className="checkbox-row">
           Transcript language
           <select
             value={languageOverride}
@@ -881,6 +959,15 @@ function App() {
           </>
         )}
       </section>
+
+      {status === "recording" && liveSubtitlesEnabled && captureSystemAudio && (
+        <section className="live-caption-area">
+          {liveCaption && <p className="live-caption">{liveCaption}</p>}
+          {liveSubtitlesCooldown && (
+            <p className="warning">GPU cooling down — live captions paused.</p>
+          )}
+        </section>
+      )}
 
       <p className="status">
         Status: <strong>{status}</strong>

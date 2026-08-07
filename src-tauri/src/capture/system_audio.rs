@@ -35,7 +35,10 @@ pub struct LoopbackCapture;
 
 #[cfg(not(target_os = "windows"))]
 impl LoopbackCapture {
-    pub fn start(_output_path: &Path) -> Result<Self> {
+    pub fn start(
+        _output_path: &Path,
+        _live_tap: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> Result<Self> {
         Err(anyhow::anyhow!(
             "system audio loopback capture is not implemented on this OS yet"
         ))
@@ -48,14 +51,22 @@ impl LoopbackCapture {
 
 #[cfg(target_os = "windows")]
 impl LoopbackCapture {
-    pub fn start(output_path: &Path) -> Result<Self> {
+    /// `live_tap`, when present, receives a best-effort clone of every chunk
+    /// of PCM as it's captured (see F6 live subtitles) in addition to the
+    /// normal file write -- a full or closed channel never affects the file
+    /// write, since the on-disk recording must not depend on anything
+    /// downstream consuming the tap.
+    pub fn start(
+        output_path: &Path,
+        live_tap: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop_flag = Arc::clone(&stop_flag);
         let output_path = output_path.to_path_buf();
 
         let handle = std::thread::Builder::new()
             .name("system-audio-loopback".to_string())
-            .spawn(move || windows_impl::capture_loop(&output_path, thread_stop_flag))
+            .spawn(move || windows_impl::capture_loop(&output_path, thread_stop_flag, live_tap))
             .map_err(|e| anyhow::anyhow!("failed to spawn loopback capture thread: {e}"))?;
 
         Ok(Self {
@@ -96,7 +107,11 @@ mod windows_impl {
         move |e| anyhow!("{context}: {e:?}")
     }
 
-    pub(super) fn capture_loop(output_path: &PathBuf, stop_flag: Arc<AtomicBool>) -> Result<()> {
+    pub(super) fn capture_loop(
+        output_path: &PathBuf,
+        stop_flag: Arc<AtomicBool>,
+        live_tap: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> Result<()> {
         initialize_mta()
             .ok()
             .map_err(wasapi_err("COM initialization failed"))?;
@@ -156,6 +171,9 @@ mod windows_impl {
             if !sample_queue.is_empty() {
                 let bytes: Vec<u8> = sample_queue.drain(..).collect();
                 out_file.write_all(&bytes)?;
+                if let Some(tap) = &live_tap {
+                    let _ = tap.send(bytes);
+                }
             }
             // Timeout is expected whenever the device is silent for a while;
             // only the stop flag decides whether the loop actually ends.
@@ -169,6 +187,9 @@ mod windows_impl {
         if !sample_queue.is_empty() {
             let bytes: Vec<u8> = sample_queue.drain(..).collect();
             out_file.write_all(&bytes)?;
+            if let Some(tap) = &live_tap {
+                let _ = tap.send(bytes);
+            }
         }
 
         audio_client

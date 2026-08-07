@@ -41,6 +41,13 @@ pub struct CaptureController {
     /// from `start` to `stop` so it can be persisted alongside the finished
     /// recording (see `commands::stop_recording`). `None` means auto-detect.
     language_override: Option<String>,
+    /// F6 live subtitles: when present, handed to `LoopbackCapture::start`
+    /// on every segment so the live-captioning pipeline keeps receiving
+    /// audio across pause/resume cycles. Set once at construction by
+    /// `commands::start_recording`; dropping it (when the whole controller
+    /// drops) is part of how that pipeline shuts down, see
+    /// `pipeline::live_subtitles::LiveSubtitles::stop`.
+    live_tap: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl CaptureController {
@@ -48,6 +55,7 @@ impl CaptureController {
         config: CaptureConfig,
         base_dir: &Path,
         language_override: Option<String>,
+        live_tap: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     ) -> Result<Self> {
         let work_dir = base_dir.join(format!("recording-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&work_dir)
@@ -60,6 +68,7 @@ impl CaptureController {
             active: None,
             status: RecordingStatus::Stopped,
             language_override,
+            live_tap,
         })
     }
 
@@ -160,7 +169,7 @@ impl CaptureController {
                 "segment-{:03}-sysaudio.f32le",
                 self.segment_index
             ));
-            let capture = LoopbackCapture::start(&pcm_path)?;
+            let capture = LoopbackCapture::start(&pcm_path, self.live_tap.clone())?;
             (Some(capture), Some(pcm_path))
         } else {
             (None, None)
@@ -242,7 +251,7 @@ mod tests {
             microphone_device: None,
             framerate: 10,
         };
-        let mut controller = CaptureController::new(config, &base_dir, None).unwrap();
+        let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
         controller.start().await.expect("start should succeed");
         assert_eq!(controller.status(), RecordingStatus::Recording);

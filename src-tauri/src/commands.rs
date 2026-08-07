@@ -7,6 +7,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
 use crate::db::{self, RecordingSummary, Segment, Summary};
 use crate::llm::{self, LlmSettings, ProviderKind};
+use crate::pipeline::live_subtitles::{self, LiveSubtitles, LiveSubtitlesSettings};
 use crate::pipeline::stt::{self, SttSettings};
 use crate::state::AppState;
 use crate::subtitle;
@@ -29,6 +30,7 @@ pub struct RecordingSettings {
 
 #[tauri::command]
 pub async fn start_recording(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     settings: RecordingSettings,
 ) -> Result<(), String> {
@@ -36,11 +38,35 @@ pub async fn start_recording(
     if guard.is_some() {
         return Err("a recording is already in progress".to_string());
     }
+
+    // F6 live subtitles: only wired up when the setting is on *and* system
+    // audio capture is enabled this session (system audio is the only tap
+    // implemented so far, see live_subtitles.rs's module doc) -- never
+    // blocks the recording itself if either isn't the case.
+    let live_settings = db::with_db(&state.db, |conn| live_subtitles::load_settings(conn))
+        .await
+        .map_err(|e| e.to_string())?;
+    let live_tap = if live_settings.enabled && settings.capture.capture_system_audio {
+        match LiveSubtitles::start(app.clone(), settings.language_override.clone()).await {
+            Ok((live, tap_tx)) => {
+                *state.live_subtitles.lock().await = Some(live);
+                Some(tap_tx)
+            }
+            Err(e) => {
+                tracing::warn!("failed to start live subtitles, continuing without them: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let recordings_dir = state.recordings_dir.lock().await.clone();
     let mut controller = CaptureController::new(
         settings.capture,
         &recordings_dir,
         settings.language_override,
+        live_tap,
     )
     .map_err(|e| e.to_string())?;
     controller.start().await.map_err(|e| e.to_string())?;
@@ -92,6 +118,14 @@ pub async fn stop_recording(
         .stop(&output_path)
         .await
         .map_err(|e| e.to_string())?;
+    // Dropping the controller here (rather than at function end) drops its
+    // clone of the live-subtitles tap sender, which is what lets that
+    // pipeline's EOF-driven shutdown in `LiveSubtitles::stop` begin
+    // immediately instead of only once this whole command returns.
+    drop(controller);
+    if let Some(live) = state.live_subtitles.lock().await.take() {
+        live.stop().await;
+    }
     // Best-effort: a missing/broken ffprobe shouldn't block the recording
     // from being saved and queued for transcription.
     let duration_ms = ffmpeg::probe_duration_ms(&result_path).await.ok();
@@ -589,6 +623,30 @@ pub async fn set_stt_settings(
     db::with_db(&state.db, move |conn| stt::save_settings(conn, &settings))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// F6 live subtitles toggle — read at `start_recording` time (see
+/// `commands::start_recording`), same global-KV-setting shape as
+/// `get_stt_settings`/`set_stt_settings`.
+#[tauri::command]
+pub async fn get_live_subtitle_settings(
+    state: State<'_, AppState>,
+) -> Result<LiveSubtitlesSettings, String> {
+    db::with_db(&state.db, |conn| live_subtitles::load_settings(conn))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_live_subtitle_settings(
+    state: State<'_, AppState>,
+    settings: LiveSubtitlesSettings,
+) -> Result<(), String> {
+    db::with_db(&state.db, move |conn| {
+        live_subtitles::save_settings(conn, &settings)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

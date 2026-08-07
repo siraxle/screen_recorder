@@ -9,7 +9,7 @@ use tokio::process::{ChildStderr, ChildStdout, Command};
 
 use crate::db::{self, Segment};
 
-const DEFAULT_MODEL: &str = "small";
+pub(super) const DEFAULT_MODEL: &str = "small";
 
 /// The two interchangeable STT backends (see CLAUDE.md: "runtime selected by
 /// target hardware — never hardcode one runtime"). Both speak the same
@@ -92,7 +92,7 @@ pub struct TranscriptionResult {
     pub segments: Vec<Segment>,
 }
 
-fn python_dir() -> PathBuf {
+pub(super) fn python_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR is `<repo>/src-tauri` at compile time, so this
     // resolves correctly regardless of the process's working directory
     // (`cargo tauri dev` vs. a packaged app).

@@ -155,6 +155,38 @@ pub fn build_mux_command(
     cmd
 }
 
+/// Builds the live-subtitles resampler (F6): a long-lived ffmpeg process
+/// that downmixes/downsamples the raw loopback tap (48kHz stereo f32le) to
+/// what `whisper_worker.py --live` expects (16kHz mono f32le), reading raw
+/// PCM from stdin and writing raw PCM to stdout. Kept as ffmpeg rather than
+/// hand-rolled Rust DSP, matching this app's "FFmpeg as a subprocess" rule.
+/// Closing stdin makes ffmpeg flush and exit, which is how the caller shuts
+/// the whole live-subtitles pipeline down.
+pub fn build_resample_command() -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-f")
+        .arg("f32le")
+        .arg("-ar")
+        .arg(system_audio::SAMPLE_RATE.to_string())
+        .arg("-ac")
+        .arg(system_audio::CHANNELS.to_string())
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-f")
+        .arg("f32le")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-ac")
+        .arg("1")
+        .arg("pipe:1");
+
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Concatenates finalized segments (already muxed with all their audio) into
 /// the final recording, via ffmpeg's concat demuxer with stream copy.
 pub fn build_concat_command(list_file: &Path, output_path: &Path) -> Command {
