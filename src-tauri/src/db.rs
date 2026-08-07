@@ -691,3 +691,34 @@ pub fn get_translated_segments(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
+
+/// Every language with a persisted translation for this recording -- lets
+/// the UI rehydrate `translatedLanguages` (and so the export/"Save" button)
+/// after a reload, instead of relying solely on the in-session
+/// `translation-updated` event that produced it originally.
+pub fn list_translated_languages(conn: &Connection, recording_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT language FROM translated_segments WHERE recording_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map([recording_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// True if a `translate` job for this recording is already queued or
+/// running -- guards `commands::translate_subtitles` against enqueueing a
+/// second job that would silently redo the same LLM work `run_translation`
+/// already has in flight (it has no partial-progress resume, only a
+/// full-segments rewrite at the end).
+pub fn has_active_translate_job(conn: &Connection, recording_id: &str) -> Result<bool> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM jobs WHERE recording_id = ?1 AND stage = 'translate' \
+             AND status IN ('pending', 'running') LIMIT 1",
+            [recording_id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}

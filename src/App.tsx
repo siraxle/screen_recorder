@@ -92,6 +92,11 @@ interface ExportSubtitlesResult {
   paths: string[];
 }
 
+interface TranslationStateResult {
+  languages: string[];
+  inProgress: boolean;
+}
+
 const LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
   { code: "", label: "Auto-detect" },
   { code: "en", label: "English" },
@@ -276,6 +281,23 @@ function App() {
       .then(setSummary)
       .catch((e) => setError(String(e)));
   }, [pipeline?.status]);
+
+  // Rehydrates translatedLanguages/translating from the DB whenever the
+  // selected recording changes -- both are otherwise pure React state that
+  // only the translation-progress/translation-updated events populate, so a
+  // page reload (or this app's own restart) would otherwise hide the
+  // export/"Save" button and any in-flight translate job silently.
+  useEffect(() => {
+    const recordingId = pipeline?.id;
+    if (!recordingId) return;
+    invoke<TranslationStateResult>("get_translation_state", { recordingId })
+      .then((result) => {
+        if (recordingIdRef.current !== recordingId) return;
+        setTranslatedLanguages(new Set(result.languages));
+        if (result.inProgress) setTranslating(true);
+      })
+      .catch((e) => setError(String(e)));
+  }, [pipeline?.id]);
 
   useEffect(() => {
     const unlisten = listen<RecordingSummary>("recording-updated", (event) => {

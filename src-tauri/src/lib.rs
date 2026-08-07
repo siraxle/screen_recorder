@@ -75,6 +75,7 @@ pub fn run() {
             commands::generate_summary,
             commands::get_summary,
             commands::translate_subtitles,
+            commands::get_translation_state,
             commands::pause_translation,
             commands::resume_translation,
             commands::cancel_translation,

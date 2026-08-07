@@ -221,6 +221,9 @@ fn write_subtitle_file(video_path: &std::path::Path, file_name: &str, contents: 
         .parent()
         .map(|dir| dir.join(file_name))
         .unwrap_or_else(|| PathBuf::from(file_name));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
     std::fs::write(&path, contents).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
@@ -264,6 +267,9 @@ pub async fn export_subtitles(
         .map_err(|e| e.to_string())?;
         let contents = render_subtitles(&format, &segments);
         let output_path = video_path.with_extension(&format);
+        if let Some(dir) = output_path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
         std::fs::write(&output_path, contents).map_err(|e| e.to_string())?;
         return Ok(ExportSubtitlesResult { paths: vec![output_path.to_string_lossy().to_string()] });
     }
@@ -440,6 +446,37 @@ async fn ensure_llm_provider_configured(state: &State<'_, AppState>) -> Result<(
     Ok(())
 }
 
+/// `get_translation_state`'s response: which languages already have a
+/// persisted translation, and whether a `translate` job for this recording
+/// is still queued or running. The frontend calls this whenever the
+/// selected recording changes so `translatedLanguages`/`translating` (pure
+/// React state) get rehydrated from the DB instead of staying empty after a
+/// page reload or app restart, even though the backend job queue survives
+/// one (see `pipeline::recover_and_enqueue`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationStateResult {
+    pub languages: Vec<String>,
+    pub in_progress: bool,
+}
+
+#[tauri::command]
+pub async fn get_translation_state(
+    state: State<'_, AppState>,
+    recording_id: String,
+) -> Result<TranslationStateResult, String> {
+    let languages = {
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::list_translated_languages(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let in_progress = db::with_db(&state.db, move |conn| db::has_active_translate_job(conn, &recording_id))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(TranslationStateResult { languages, in_progress })
+}
+
 /// Validates that a transcript and a usable provider both exist, then
 /// enqueues a `translate` job (F8). Mirrors `generate_summary`'s validation
 /// order for the same reason: no data goes anywhere until the provider is
@@ -463,6 +500,16 @@ pub async fn translate_subtitles(
     };
     if segments.is_empty() {
         return Err("no transcript available for this recording yet".to_string());
+    }
+
+    let already_active = {
+        let rid = recording_id.clone();
+        db::with_db(&state.db, move |conn| db::has_active_translate_job(conn, &rid))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if already_active {
+        return Err("a translation is already in progress for this recording".to_string());
     }
 
     ensure_llm_provider_configured(&state).await?;
