@@ -19,14 +19,15 @@ use std::time::Duration;
 
 /// GPU temp at/above which local LLM calls pause. Set by hand (not
 /// discovered from hardware limits) per user direction: this machine
-/// shut itself down during F8/F9 dual-subtitle translation, so 87 C is a
+/// shut itself down during F8/F9 dual-subtitle translation, so 83 C is a
 /// deliberately conservative ceiling rather than the card's actual
-/// throttle/shutdown point.
-pub const PAUSE_AT_C: u32 = 87;
+/// throttle/shutdown point. Lowered from 87 C after the ceiling still ran
+/// too hot in practice.
+pub const PAUSE_AT_C: u32 = 83;
 
 /// Resume threshold, below `PAUSE_AT_C` so the guard doesn't toggle on
 /// every poll while the GPU hovers near the ceiling.
-pub const RESUME_AT_C: u32 = 80;
+pub const RESUME_AT_C: u32 = 76;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
