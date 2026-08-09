@@ -2,6 +2,7 @@ mod capture;
 mod commands;
 mod db;
 mod llm;
+mod overlay;
 mod pipeline;
 mod state;
 mod subtitle;
@@ -87,6 +88,8 @@ pub fn run() {
             commands::set_stt_settings,
             commands::get_live_subtitle_settings,
             commands::set_live_subtitle_settings,
+            commands::show_annotation_overlay,
+            commands::hide_annotation_overlay,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

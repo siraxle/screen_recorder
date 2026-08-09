@@ -7,6 +7,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
 use crate::db::{self, RecordingSummary, Segment, Summary};
 use crate::llm::{self, LlmSettings, ProviderKind};
+use crate::overlay;
 use crate::pipeline::live_subtitles::{self, LiveSubtitles, LiveSubtitlesSettings};
 use crate::pipeline::stt::{self, SttSettings};
 use crate::state::AppState;
@@ -204,6 +205,19 @@ pub async fn set_recordings_dir(state: State<'_, AppState>, path: String) -> Res
 pub async fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatus, String> {
     let guard = state.controller.lock().await;
     Ok(guard.as_ref().map(|c| c.status()).unwrap_or(RecordingStatus::Stopped))
+}
+
+/// Shows the on-screen annotation toolbar + transparent drawing overlay
+/// (rectangle/oval/line highlighting), so it can be shown/hidden
+/// independently of whether a recording is active.
+#[tauri::command]
+pub async fn show_annotation_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    overlay::show(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn hide_annotation_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    overlay::hide(&app).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

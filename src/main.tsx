@@ -1,12 +1,26 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
+import AnnotationCanvas from "./annotation/AnnotationCanvas";
+import AnnotationToolbar from "./annotation/AnnotationToolbar";
 import { ErrorBoundary } from "./ErrorBoundary";
+
+function RootForWindow() {
+  switch (getCurrentWindow().label) {
+    case "annotation-canvas":
+      return <AnnotationCanvas />;
+    case "annotation-toolbar":
+      return <AnnotationToolbar />;
+    default:
+      return <App />;
+  }
+}
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <ErrorBoundary>
-      <App />
+      <RootForWindow />
     </ErrorBoundary>
   </React.StrictMode>,
 );

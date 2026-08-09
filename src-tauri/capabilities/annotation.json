@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "annotation-overlay",
+  "description": "Capability for the annotation overlay windows (drawing canvas + toolbar)",
+  "windows": ["annotation-canvas", "annotation-toolbar"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-ignore-cursor-events"
+  ]
+}

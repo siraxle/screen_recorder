@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { EVENT_CLOSED } from "./annotation/types";
 import "./App.css";
 
 type RecordingStatus = "recording" | "paused" | "stopped";
@@ -249,6 +250,7 @@ function App() {
   const [customLanguage, setCustomLanguage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [annotationOverlayVisible, setAnnotationOverlayVisible] = useState(false);
 
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [pipeline, setPipeline] = useState<RecordingSummary | null>(null);
@@ -402,6 +404,18 @@ function App() {
         next.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
         return next;
       });
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    // Fired by the overlay toolbar's own Close button, so this window's
+    // toggle button stays in sync when the overlay is dismissed from there
+    // instead of from here.
+    const unlisten = listen(EVENT_CLOSED, () => {
+      setAnnotationOverlayVisible(false);
     });
     return () => {
       unlisten.then((f) => f());
@@ -713,6 +727,12 @@ function App() {
       setTranscriptionProgress(null);
       refreshRecordings();
     }
+  }
+
+  async function handleToggleAnnotationOverlay() {
+    const nextVisible = !annotationOverlayVisible;
+    await run(() => invoke(nextVisible ? "show_annotation_overlay" : "hide_annotation_overlay"));
+    setAnnotationOverlayVisible(nextVisible);
   }
 
   function selectRecording(recording: RecordingSummary) {
@@ -1177,6 +1197,9 @@ function App() {
             </button>
           </>
         )}
+        <button disabled={busy} onClick={handleToggleAnnotationOverlay}>
+          {annotationOverlayVisible ? "Hide annotation toolbar" : "Show annotation toolbar"}
+        </button>
       </section>
 
       {status === "recording" && liveSubtitlesEnabled && captureSystemAudio && (

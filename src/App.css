@@ -251,10 +251,67 @@ button {
   outline: none;
 }
 
+.annotation-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+}
+
+.annotation-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  height: 100%;
+  padding: 0 0.75rem;
+  box-sizing: border-box;
+}
+
+.annotation-tool-btn {
+  padding: 0.4em 0.7em;
+  font-size: 0.85em;
+}
+
+.annotation-tool-btn.active {
+  border-color: #396cd8;
+  background-color: #d9e4fa;
+}
+
+.annotation-swatch {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  box-shadow: none;
+}
+
+.annotation-swatch.active {
+  border-color: #396cd8;
+}
+
+.annotation-divider {
+  width: 1px;
+  height: 24px;
+  background-color: #ccc;
+  margin: 0 0.25rem;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
     background-color: #2f2f2f;
+  }
+
+  .annotation-tool-btn.active {
+    background-color: #2a3d63;
+  }
+
+  .annotation-divider {
+    background-color: #444;
   }
 
   .subtitle {
