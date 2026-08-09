@@ -102,6 +102,8 @@ pub fn run() {
             commands::pause_recording,
             commands::resume_recording,
             commands::stop_recording,
+            commands::pick_import_file,
+            commands::import_recording,
             commands::recording_status,
             commands::list_recordings,
             commands::rename_recording,

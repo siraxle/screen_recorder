@@ -158,6 +158,95 @@ pub async fn stop_recording(
     })
 }
 
+/// Opens the native file picker filtered to common video/audio containers,
+/// for `import_recording`. Returns `None` if the user cancelled.
+#[tauri::command]
+pub async fn pick_import_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter(
+                "Video/audio",
+                &[
+                    "mp4", "mov", "mkv", "avi", "webm", "mp3", "wav", "m4a", "flac", "ogg",
+                ],
+            )
+            .blocking_pick_file()
+            .map(|p| p.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Imports an already-existing video/audio file (F2 applied to a file the
+/// user picks instead of one just captured): copies it into its own folder
+/// under `recordings_dir` — mirroring `stop_recording`'s one-folder-per-
+/// recording convention, so `delete_recording`'s `remove_dir_all` never
+/// touches the user's original file — then enqueues it for transcription
+/// exactly like a freshly stopped recording.
+#[tauri::command]
+pub async fn import_recording(
+    state: State<'_, AppState>,
+    path: String,
+    language_override: Option<String>,
+) -> Result<StopRecordingResult, String> {
+    let source_path = PathBuf::from(&path);
+    if !source_path.is_file() {
+        return Err(format!("\"{path}\" is not a file"));
+    }
+
+    let recordings_dir = state.recordings_dir.lock().await.clone();
+    let folder_name = format!(
+        "imported-{}",
+        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+    );
+    let recording_folder = recordings_dir.join(folder_name);
+    std::fs::create_dir_all(&recording_folder).map_err(|e| e.to_string())?;
+
+    let extension = source_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4");
+    let dest_path = recording_folder.join(format!("source.{extension}"));
+    tokio::fs::copy(&source_path, &dest_path)
+        .await
+        .map_err(|e| format!("failed to copy \"{path}\": {e}"))?;
+
+    let title = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string);
+
+    // Best-effort: a missing/broken ffprobe shouldn't block the import.
+    let duration_ms = ffmpeg::probe_duration_ms(&dest_path).await.ok();
+
+    let recording_id = uuid::Uuid::new_v4().to_string();
+    let job_id = {
+        let recording_id = recording_id.clone();
+        let video_path = dest_path.clone();
+        let language_override = language_override.clone();
+        db::with_db(&state.db, move |conn| {
+            let job_id = db::insert_recording_with_transcribe_job(
+                conn,
+                &recording_id,
+                &video_path,
+                language_override.as_deref(),
+                duration_ms,
+            )?;
+            db::set_recording_title(conn, &recording_id, title.as_deref())?;
+            Ok(job_id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
+    let _ = state.job_tx.send(job_id);
+
+    Ok(StopRecordingResult {
+        recording_id,
+        video_path: dest_path.to_string_lossy().to_string(),
+    })
+}
+
 #[tauri::command]
 pub async fn get_recordings_dir(state: State<'_, AppState>) -> Result<String, String> {
     Ok(state.recordings_dir.lock().await.to_string_lossy().to_string())

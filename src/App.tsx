@@ -741,6 +741,32 @@ function App() {
     }
   }
 
+  async function handleImportFile() {
+    const chosen = await run(() => invoke<string | null>("pick_import_file"));
+    if (!chosen) return;
+    const result = await run(() =>
+      invoke<StopRecordingResult>("import_recording", {
+        path: chosen,
+        languageOverride: resolveLanguageOverride(),
+      })
+    );
+    if (result) {
+      recordingIdRef.current = result.recordingId;
+      setPipeline({
+        id: result.recordingId,
+        videoPath: result.videoPath,
+        createdAt: "",
+        status: "recorded",
+        detectedLanguage: null,
+        durationMs: null,
+        title: null,
+        compressedPath: null,
+      });
+      setTranscriptionProgress(null);
+      refreshRecordings();
+    }
+  }
+
   async function handleToggleAnnotationOverlay() {
     const nextVisible = !annotationOverlayVisible;
     await run(() => invoke(nextVisible ? "show_annotation_overlay" : "hide_annotation_overlay"));
@@ -878,7 +904,12 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>Recordings library</h2>
+        <div className="header-row">
+          <h2>Recordings library</h2>
+          <button disabled={busy} onClick={handleImportFile}>
+            Import file…
+          </button>
+        </div>
         <label className="checkbox-row path-row">
           Search by name, transcripts &amp; summaries
           <input
