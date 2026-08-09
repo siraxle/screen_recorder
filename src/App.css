@@ -68,6 +68,40 @@ h1 {
   gap: 0.75rem;
 }
 
+.header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  width: 100%;
+}
+
+.header-row h1,
+.header-row .subtitle {
+  text-align: left;
+}
+
+.settings-tabs {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.settings-tab {
+  padding: 0.5rem 1rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.settings-tab.active {
+  background: #0f0f0f;
+  color: #fff;
+  border-color: #0f0f0f;
+}
+
 .status {
   font-size: 1.1em;
 }
@@ -332,6 +366,16 @@ button {
 
   .panel {
     border-color: #444;
+  }
+
+  .settings-tab {
+    border-color: #444;
+  }
+
+  .settings-tab.active {
+    background: #f6f6f6;
+    color: #0f0f0f;
+    border-color: #f6f6f6;
   }
 
   input,

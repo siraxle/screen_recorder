@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
 import AnnotationCanvas from "./annotation/AnnotationCanvas";
 import AnnotationToolbar from "./annotation/AnnotationToolbar";
+import SettingsWindow from "./settings/SettingsWindow";
 import { ErrorBoundary } from "./ErrorBoundary";
 
 function RootForWindow() {
@@ -12,6 +13,8 @@ function RootForWindow() {
       return <AnnotationCanvas />;
     case "annotation-toolbar":
       return <AnnotationToolbar />;
+    case "settings":
+      return <SettingsWindow />;
     default:
       return <App />;
   }

@@ -5,6 +5,7 @@ mod hotkeys;
 mod llm;
 mod overlay;
 mod pipeline;
+mod settings_window;
 mod state;
 mod subtitle;
 mod thermal;
@@ -129,6 +130,7 @@ pub fn run() {
             commands::hide_annotation_overlay,
             commands::get_hotkey_settings,
             commands::set_hotkey_settings,
+            commands::open_settings_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
@@ -11,6 +11,7 @@ use crate::llm::{self, LlmSettings, ProviderKind};
 use crate::overlay;
 use crate::pipeline::live_subtitles::{self, LiveSubtitles, LiveSubtitlesSettings};
 use crate::pipeline::stt::{self, SttSettings};
+use crate::settings_window;
 use crate::state::AppState;
 use crate::subtitle;
 
@@ -703,12 +704,28 @@ pub async fn get_stt_settings(state: State<'_, AppState>) -> Result<SttSettings,
 
 #[tauri::command]
 pub async fn set_stt_settings(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     settings: SttSettings,
 ) -> Result<(), String> {
-    db::with_db(&state.db, move |conn| stt::save_settings(conn, &settings))
-        .await
+    db::with_db(&state.db, {
+        let settings = settings.clone();
+        move |conn| stt::save_settings(conn, &settings)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // The Settings window edits this independently of the main window's own
+    // copy (each Tauri window is a separate webview/JS runtime) — broadcast
+    // so the main window's recording-language picker stays in sync.
+    app.emit("stt-settings-changed", &settings)
         .map_err(|e| e.to_string())
+}
+
+/// Opens (or refocuses) the Settings window — Speech recognition, Hotkeys,
+/// and LLM provider tabs, see `SettingsWindow.tsx`.
+#[tauri::command]
+pub async fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
+    settings_window::show(&app).map_err(|e| e.to_string())
 }
 
 /// F6 live subtitles toggle — read at `start_recording` time (see
