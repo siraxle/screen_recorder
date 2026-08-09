@@ -100,7 +100,7 @@ interface TranslationStateResult {
 }
 
 interface SearchMatch {
-  source: "transcript" | "summary";
+  source: "transcript" | "summary" | "title";
   snippet: string;
   startMs: number | null;
 }
@@ -834,7 +834,7 @@ function App() {
       <section className="panel">
         <h2>Recordings library</h2>
         <label className="checkbox-row path-row">
-          Search transcripts &amp; summaries
+          Search by name, transcripts &amp; summaries
           <input
             type="text"
             value={searchQuery}
@@ -863,10 +863,11 @@ function App() {
                 </div>
                 {result.matches.map((match, i) => (
                   <p key={i} className="search-snippet">
-                    {match.startMs !== null && (
+                    {match.source === "transcript" && match.startMs !== null && (
                       <code>{formatTimecode(match.startMs)}</code>
                     )}
-                    {match.startMs === null && <code>summary</code>}
+                    {match.source === "summary" && <code>summary</code>}
+                    {match.source === "title" && <code>name</code>}
                     {" "}
                     {renderSnippet(match.snippet)}
                   </p>

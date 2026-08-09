@@ -849,11 +849,62 @@ fn build_match_query(query: &str) -> Option<String> {
     }
 }
 
-/// F11: full-text search across transcript segments and summaries. Results
-/// are grouped by recording (at most 3 transcript matches + 1 summary match
-/// each) and ordered most-recent-first, matching `list_recordings` -- bm25
-/// scores from the two separate FTS5 tables aren't on a comparable scale, so
-/// relevance-ranking across sources isn't attempted.
+/// Highlights `query_tokens` inside a recording title (AND semantics: every
+/// token must occur, same as the FTS5 `MATCH` expression used for
+/// transcript/summary matches). Works in chars rather than bytes/a
+/// lowercased copy of the whole string so multi-byte UTF-8 (Cyrillic titles
+/// are the common case here) can never desync mark positions from content.
+fn highlight_title(title: &str, query_tokens: &[Vec<char>]) -> Option<String> {
+    if query_tokens.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = title.chars().collect();
+    let mut marks = vec![false; chars.len()];
+    for token_chars in query_tokens {
+        if token_chars.is_empty() || token_chars.len() > chars.len() {
+            return None;
+        }
+        let mut matched_this_token = false;
+        for start in 0..=(chars.len() - token_chars.len()) {
+            let is_match = token_chars
+                .iter()
+                .enumerate()
+                .all(|(i, tc)| chars[start + i].to_lowercase().eq(tc.to_lowercase()));
+            if is_match {
+                matched_this_token = true;
+                for mark in &mut marks[start..start + token_chars.len()] {
+                    *mark = true;
+                }
+            }
+        }
+        if !matched_this_token {
+            return None;
+        }
+    }
+    let mut out = String::new();
+    let mut in_mark = false;
+    for (i, ch) in chars.iter().enumerate() {
+        if marks[i] && !in_mark {
+            out.push_str(SNIPPET_MARK_START);
+            in_mark = true;
+        } else if !marks[i] && in_mark {
+            out.push_str(SNIPPET_MARK_END);
+            in_mark = false;
+        }
+        out.push(*ch);
+    }
+    if in_mark {
+        out.push_str(SNIPPET_MARK_END);
+    }
+    Some(out)
+}
+
+/// F11: full-text search across transcript segments, summaries, and
+/// recording names. Results are grouped by recording (at most 3 transcript
+/// matches + 1 summary match + 1 name match each) and ordered
+/// most-recent-first, matching `list_recordings` -- bm25 scores from the two
+/// separate FTS5 tables aren't on a comparable scale, so relevance-ranking
+/// across sources isn't attempted.
 pub fn search_recordings(conn: &Connection, query: &str) -> Result<Vec<SearchResult>> {
     let Some(match_expr) = build_match_query(query) else {
         return Ok(Vec::new());
@@ -934,6 +985,19 @@ pub fn search_recordings(conn: &Connection, query: &str) -> Result<Vec<SearchRes
             SearchMatch { source: "summary".to_string(), snippet, start_ms: None },
             1,
         );
+    }
+
+    let title_tokens: Vec<Vec<char>> =
+        query.split_whitespace().map(|t| t.chars().collect()).collect();
+    let mut title_stmt =
+        conn.prepare("SELECT id, title FROM recordings WHERE title IS NOT NULL AND title != ''")?;
+    let title_rows = title_stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (recording_id, title) in title_rows {
+        if let Some(snippet) = highlight_title(&title, &title_tokens) {
+            push_match(recording_id, SearchMatch { source: "title".to_string(), snippet, start_ms: None }, 1);
+        }
     }
 
     let mut results: Vec<SearchResult> = order
@@ -1048,5 +1112,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(search_recordings(&conn, "budg").unwrap().len(), 1);
+    }
+
+    /// Searching by recording name matches the user-set title (highlighted,
+    /// no timecode) even when the transcript/summary don't contain the
+    /// query, and doesn't match recordings that never got a custom title.
+    #[test]
+    fn search_matches_recording_title() {
+        let conn = open_test_db();
+        insert_recording_with_transcribe_job(&conn, "rec-1", Path::new("rec-1.mp4"), None, None)
+            .unwrap();
+        insert_recording_with_transcribe_job(&conn, "rec-2", Path::new("rec-2.mp4"), None, None)
+            .unwrap();
+        set_recording_title(&conn, "rec-1", Some("Sprint Planning Meeting")).unwrap();
+
+        let hits = search_recordings(&conn, "planning").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].recording.id, "rec-1");
+        assert_eq!(hits[0].matches.len(), 1);
+        let m = &hits[0].matches[0];
+        assert_eq!(m.source, "title");
+        assert_eq!(m.start_ms, None);
+        assert!(m.snippet.contains(&format!("{SNIPPET_MARK_START}Planning{SNIPPET_MARK_END}")));
+
+        assert!(search_recordings(&conn, "nonexistentword").unwrap().is_empty());
     }
 }
