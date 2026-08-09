@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { emit } from "@tauri-apps/api/event";
+import { useEffect, useState } from "react";
+import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { EVENT_CLEAR, EVENT_CLOSED, EVENT_SET_COLOR, EVENT_SET_TOOL, EVENT_UNDO, PRESET_COLORS, ToolMode } from "./types";
 
@@ -13,6 +13,16 @@ const TOOLS: { mode: ToolMode; label: string }[] = [
 export default function AnnotationToolbar() {
   const [tool, setTool] = useState<ToolMode>("pointer");
   const [color, setColor] = useState(PRESET_COLORS[0]);
+
+  // The canvas window resets itself to "pointer" as soon as a shape is
+  // finished drawing, so the toolbar's own tool highlight needs to follow
+  // that broadcast rather than only reacting to local clicks.
+  useEffect(() => {
+    const unlisten = listen<ToolMode>(EVENT_SET_TOOL, (e) => setTool(e.payload));
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
 
   const selectTool = (mode: ToolMode) => {
     setTool(mode);
@@ -38,15 +48,17 @@ export default function AnnotationToolbar() {
 
       <span className="annotation-divider" />
 
-      {PRESET_COLORS.map((preset) => (
-        <button
-          key={preset}
-          className={`annotation-swatch${color === preset ? " active" : ""}`}
-          style={{ backgroundColor: preset }}
-          onClick={() => selectColor(preset)}
-          aria-label={`Color ${preset}`}
-        />
-      ))}
+      <div className="annotation-colors">
+        {PRESET_COLORS.map((preset) => (
+          <button
+            key={preset}
+            className={`annotation-swatch${color === preset ? " active" : ""}`}
+            style={{ backgroundColor: preset }}
+            onClick={() => selectColor(preset)}
+            aria-label={`Color ${preset}`}
+          />
+        ))}
+      </div>
 
       <span className="annotation-divider" />
 

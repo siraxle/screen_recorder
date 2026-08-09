@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   EVENT_CLEAR,
@@ -120,6 +120,11 @@ export default function AnnotationCanvas() {
       ...s,
       { id: crypto.randomUUID(), type: tool as ShapeType, x1, y1, x2, y2, color },
     ]);
+    // Deselect the drawing tool once a shape is placed, so the toolbar
+    // reverts to its inactive state and the user can close it right away
+    // instead of staying stuck in draw mode.
+    setTool("pointer");
+    emit(EVENT_SET_TOOL, "pointer");
   };
 
   return (
