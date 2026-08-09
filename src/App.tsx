@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { EVENT_CLOSED } from "./annotation/types";
+import { EVENT_CLOSED, EVENT_OPENED } from "./annotation/types";
 import "./App.css";
 
 type RecordingStatus = "recording" | "paused" | "stopped";
@@ -19,6 +19,10 @@ type SttEngine = "whisper" | "parakeet";
 
 interface SttSettings {
   engine: SttEngine;
+}
+
+interface HotkeySettings {
+  toggleAnnotation: string;
 }
 
 interface LlmSettings {
@@ -240,6 +244,10 @@ const DEFAULT_LLM_SETTINGS: LlmSettingsResponse = {
   cloudTokenConfigured: false,
 };
 
+// Mirrors src-tauri/src/hotkeys.rs::DEFAULT_TOGGLE_ANNOTATION — used only as
+// the initial state before `get_hotkey_settings` resolves.
+const DEFAULT_HOTKEY_SETTINGS: HotkeySettings = { toggleAnnotation: "CommandOrControl+Shift+A" };
+
 function App() {
   const [status, setStatus] = useState<RecordingStatus>("stopped");
   const [microphones, setMicrophones] = useState<string[]>([]);
@@ -273,6 +281,11 @@ function App() {
 
   const [sttSettings, setSttSettings] = useState<SttSettings>({ engine: "whisper" });
   const [sttSettingsSaved, setSttSettingsSaved] = useState(false);
+
+  const [hotkeySettings, setHotkeySettings] = useState<HotkeySettings>(DEFAULT_HOTKEY_SETTINGS);
+  const [hotkeyInput, setHotkeyInput] = useState<string>(DEFAULT_HOTKEY_SETTINGS.toggleAnnotation);
+  const [hotkeySettingsSaved, setHotkeySettingsSaved] = useState(false);
+  const [hotkeyError, setHotkeyError] = useState<string | null>(null);
 
   const [liveSubtitlesEnabled, setLiveSubtitlesEnabled] = useState(false);
   const [liveCaption, setLiveCaption] = useState<string>("");
@@ -318,6 +331,15 @@ function App() {
   useEffect(() => {
     invoke<SttSettings>("get_stt_settings")
       .then(setSttSettings)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    invoke<HotkeySettings>("get_hotkey_settings")
+      .then((s) => {
+        setHotkeySettings(s);
+        setHotkeyInput(s.toggleAnnotation);
+      })
       .catch((e) => setError(String(e)));
   }, []);
 
@@ -411,14 +433,20 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // Fired by the overlay toolbar's own Close button, so this window's
-    // toggle button stays in sync when the overlay is dismissed from there
-    // instead of from here.
-    const unlisten = listen(EVENT_CLOSED, () => {
+    // Fired by the overlay toolbar's own Close button, by Esc inside the
+    // overlay, and by the Rust side when the global hotkey closes it, so
+    // this window's toggle button stays in sync regardless of trigger.
+    const unlistenClosed = listen(EVENT_CLOSED, () => {
       setAnnotationOverlayVisible(false);
     });
+    // Fired by the Rust side when the global hotkey opens the overlay, so
+    // the toggle button also stays in sync in that direction.
+    const unlistenOpened = listen(EVENT_OPENED, () => {
+      setAnnotationOverlayVisible(true);
+    });
     return () => {
-      unlisten.then((f) => f());
+      unlistenClosed.then((f) => f());
+      unlistenOpened.then((f) => f());
     };
   }, []);
 
@@ -578,6 +606,22 @@ function App() {
       setSttSettingsSaved(true);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveHotkeySettings() {
+    setHotkeySettingsSaved(false);
+    setHotkeyError(null);
+    setBusy(true);
+    try {
+      const settings: HotkeySettings = { toggleAnnotation: hotkeyInput.trim() };
+      await invoke("set_hotkey_settings", { settings });
+      setHotkeySettings(settings);
+      setHotkeySettingsSaved(true);
+    } catch (e) {
+      setHotkeyError(String(e));
     } finally {
       setBusy(false);
     }
@@ -992,6 +1036,34 @@ function App() {
           NVIDIA Parakeet-TDT-0.6B-v3 — ~25 languages, much faster, no language auto-detect
         </label>
         {sttSettingsSaved && <span className="output"> Saved.</span>}
+      </section>
+
+      <section className="panel">
+        <h2>Hotkeys</h2>
+        <label className="checkbox-row">
+          Show/hide annotation toolbar:{" "}
+          <input
+            type="text"
+            value={hotkeyInput}
+            onChange={(e) => {
+              setHotkeyInput(e.target.value);
+              setHotkeySettingsSaved(false);
+            }}
+            placeholder="CommandOrControl+Shift+A"
+          />
+        </label>
+        <p className="hint">
+          Works from anywhere, even while another app is focused. Format example:
+          CommandOrControl+Shift+A (Ctrl on Windows/Linux, Cmd on macOS).
+        </p>
+        <button
+          disabled={busy || hotkeyInput.trim() === hotkeySettings.toggleAnnotation}
+          onClick={handleSaveHotkeySettings}
+        >
+          Save
+        </button>
+        {hotkeySettingsSaved && <span className="output"> Saved.</span>}
+        {hotkeyError && <span className="error"> {hotkeyError}</span>}
       </section>
 
       <section className="panel">

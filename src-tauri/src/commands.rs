@@ -6,6 +6,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
 use crate::db::{self, RecordingSummary, Segment, Summary};
+use crate::hotkeys::{self, HotkeySettings};
 use crate::llm::{self, LlmSettings, ProviderKind};
 use crate::overlay;
 use crate::pipeline::live_subtitles::{self, LiveSubtitles, LiveSubtitlesSettings};
@@ -218,6 +219,30 @@ pub async fn show_annotation_overlay(app: tauri::AppHandle) -> Result<(), String
 #[tauri::command]
 pub async fn hide_annotation_overlay(app: tauri::AppHandle) -> Result<(), String> {
     overlay::hide(&app).map_err(|e| e.to_string())
+}
+
+/// The user-configurable OS-wide hotkey that opens/closes the annotation
+/// overlay (see `hotkeys::apply`) — read at startup and whenever the setting
+/// changes, same global-KV-setting shape as `get_stt_settings`.
+#[tauri::command]
+pub async fn get_hotkey_settings(state: State<'_, AppState>) -> Result<HotkeySettings, String> {
+    db::with_db(&state.db, |conn| hotkeys::load_settings(conn))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_hotkey_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    settings: HotkeySettings,
+) -> Result<(), String> {
+    hotkeys::apply(&app, &state, &settings.toggle_annotation)
+        .await
+        .map_err(|e| e.to_string())?;
+    db::with_db(&state.db, move |conn| hotkeys::save_settings(conn, &settings))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

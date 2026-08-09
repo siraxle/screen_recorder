@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import {
   EVENT_CLEAR,
+  EVENT_CLOSED,
   EVENT_SET_COLOR,
   EVENT_SET_TOOL,
   EVENT_UNDO,
@@ -94,6 +96,25 @@ export default function AnnotationCanvas() {
       unlistenUndo.then((f) => f());
       unlistenClear.then((f) => f());
     };
+  }, []);
+
+  // This window briefly holds OS focus while the user is dragging out a
+  // shape (see handleMouseDown), so Esc has to be handled here too, not just
+  // in the toolbar. Mid-drag, Esc cancels just the in-progress shape;
+  // otherwise it closes the whole overlay, same as the toolbar's Close button.
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (draftStart.current) {
+        draftStart.current = null;
+        setDraft(null);
+        return;
+      }
+      emit(EVENT_CLOSED);
+      invoke("hide_annotation_overlay");
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {

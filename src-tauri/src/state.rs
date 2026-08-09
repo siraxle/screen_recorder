@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use tauri_plugin_global_shortcut::Shortcut;
+
 use crate::capture::CaptureController;
 use crate::db::SharedConn;
 use crate::pipeline::live_subtitles::LiveSubtitles;
@@ -29,4 +31,8 @@ pub struct AppState {
     /// see `pipeline::TranslationControl` and `commands::pause_translation`/
     /// `resume_translation`/`cancel_translation`.
     pub translation_controls: Mutex<HashMap<String, Arc<TranslationControl>>>,
+    /// The currently-registered OS-level hotkey for `overlay::toggle`, so
+    /// `hotkeys::apply` can unregister it before registering a replacement
+    /// when the user changes the setting (see `commands::set_hotkey_settings`).
+    pub active_hotkey: Mutex<Option<Shortcut>>,
 }

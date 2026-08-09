@@ -58,6 +58,10 @@ pub fn show(app: &AppHandle) -> Result<()> {
         }
     }
 
+    // Lets the main window's toggle button stay in sync when the overlay is
+    // opened from the global hotkey instead of from that button itself.
+    app.emit("annotation:opened", ())?;
+
     Ok(())
 }
 
@@ -65,6 +69,10 @@ pub fn show(app: &AppHandle) -> Result<()> {
 /// drawn shapes, so the next `show` starts from a blank canvas.
 pub fn hide(app: &AppHandle) -> Result<()> {
     app.emit("annotation:clear", ())?;
+    // Mirrors the toolbar's own Close button (see AnnotationToolbar.tsx),
+    // so hotkey- and Esc-triggered closes also keep the main window's
+    // toggle button in sync.
+    app.emit("annotation:closed", ())?;
 
     if let Some(w) = app.get_webview_window(CANVAS_LABEL) {
         w.hide()?;
@@ -73,4 +81,18 @@ pub fn hide(app: &AppHandle) -> Result<()> {
         w.hide()?;
     }
     Ok(())
+}
+
+/// Toggled by the user-configurable global hotkey (see `hotkeys::apply`):
+/// shows the overlay if hidden, hides it if shown.
+pub fn toggle(app: &AppHandle) -> Result<()> {
+    let visible = app
+        .get_webview_window(CANVAS_LABEL)
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    if visible {
+        hide(app)
+    } else {
+        show(app)
+    }
 }

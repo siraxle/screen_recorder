@@ -1,6 +1,7 @@
 mod capture;
 mod commands;
 mod db;
+mod hotkeys;
 mod llm;
 mod overlay;
 mod pipeline;
@@ -9,6 +10,7 @@ mod subtitle;
 mod thermal;
 
 use tauri::Manager;
+use tauri_plugin_global_shortcut::ShortcutState;
 
 use state::AppState;
 
@@ -19,6 +21,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    // Only one custom global shortcut is ever registered at a
+                    // time (the annotation toggle — see `hotkeys::apply`), so
+                    // any press unambiguously means "toggle the overlay."
+                    if event.state() == ShortcutState::Pressed {
+                        if let Err(e) = overlay::toggle(app) {
+                            tracing::error!("failed to toggle annotation overlay via hotkey: {e:#}");
+                        }
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let db_path = app_data_dir.join("db.sqlite3");
@@ -35,6 +51,11 @@ pub fn run() {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| app_data_dir.join("recordings"));
             std::fs::create_dir_all(&recordings_dir)?;
+
+            let hotkey_settings = {
+                let conn = db.lock().expect("db mutex poisoned");
+                hotkeys::load_settings(&conn)?
+            };
 
             let job_tx = pipeline::spawn_queue_worker(db.clone(), app.handle().clone());
 
@@ -53,7 +74,23 @@ pub fn run() {
                 db,
                 job_tx,
                 translation_controls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                active_hotkey: tokio::sync::Mutex::new(None),
             });
+
+            // Registered after `manage` since `hotkeys::apply` needs
+            // `AppState.active_hotkey`; a bad or already-claimed accelerator
+            // saved from a previous run must not stop the app from starting.
+            let hotkey_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = hotkey_app.state::<AppState>();
+                if let Err(e) = hotkeys::apply(&hotkey_app, &state, &hotkey_settings.toggle_annotation).await {
+                    tracing::warn!(
+                        "failed to register annotation hotkey \"{}\": {e:#}",
+                        hotkey_settings.toggle_annotation
+                    );
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -90,6 +127,8 @@ pub fn run() {
             commands::set_live_subtitle_settings,
             commands::show_annotation_overlay,
             commands::hide_annotation_overlay,
+            commands::get_hotkey_settings,
+            commands::set_hotkey_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

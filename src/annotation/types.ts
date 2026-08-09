@@ -29,6 +29,12 @@ export const EVENT_UNDO = "annotation:undo";
 // button, and by the Rust side right before hiding the overlay so it comes
 // back blank next time (see src-tauri/src/overlay.rs::hide).
 export const EVENT_CLEAR = "annotation:clear";
-// Tells the main recorder window the overlay was closed from the toolbar's
-// own Close button, so its toggle button can stay in sync.
+// Tells the main recorder window the overlay was closed — emitted by the
+// toolbar's own Close button and Esc handling on the frontend, and by the
+// Rust side (see src-tauri/src/overlay.rs::hide) so hotkey-triggered closes
+// keep the main window's toggle button in sync too.
 export const EVENT_CLOSED = "annotation:closed";
+// Tells the main recorder window the overlay was opened from the global
+// hotkey (see src-tauri/src/overlay.rs::show), so its toggle button can stay
+// in sync even when the overlay wasn't opened from that button.
+export const EVENT_OPENED = "annotation:opened";

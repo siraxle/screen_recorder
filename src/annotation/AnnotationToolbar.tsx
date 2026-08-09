@@ -34,6 +34,22 @@ export default function AnnotationToolbar() {
     emit(EVENT_SET_COLOR, value);
   };
 
+  const closeOverlay = () => {
+    emit(EVENT_CLOSED);
+    invoke("hide_annotation_overlay");
+  };
+
+  // Esc closes the whole overlay, same as the Close button — this window
+  // holds OS focus whenever the user isn't actively dragging out a shape on
+  // the canvas (see AnnotationCanvas.tsx for the drag-in-progress case).
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeOverlay();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   return (
     <div className="annotation-toolbar">
       {TOOLS.map(({ mode, label }) => (
@@ -68,13 +84,7 @@ export default function AnnotationToolbar() {
       <button className="annotation-tool-btn" onClick={() => emit(EVENT_CLEAR)}>
         Clear
       </button>
-      <button
-        className="annotation-tool-btn"
-        onClick={() => {
-          emit(EVENT_CLOSED);
-          invoke("hide_annotation_overlay");
-        }}
-      >
+      <button className="annotation-tool-btn" onClick={closeOverlay}>
         Close
       </button>
     </div>
