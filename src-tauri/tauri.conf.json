@@ -31,6 +31,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "resources/HandBrakeCLI.exe": "HandBrakeCLI.exe",
+      "resources/HandBrakeCLI-LICENSE.txt": "HandBrakeCLI-LICENSE.txt"
+    }
   }
 }

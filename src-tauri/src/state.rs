@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,4 +35,8 @@ pub struct AppState {
     /// `hotkeys::apply` can unregister it before registering a replacement
     /// when the user changes the setting (see `commands::set_hotkey_settings`).
     pub active_hotkey: Mutex<Option<Shortcut>>,
+    /// Recording ids with a `compress_recording` job currently running --
+    /// guards against a second click starting a competing HandBrakeCLI
+    /// process against the same output file (see `commands::compress_recording`).
+    pub compressing: Mutex<HashSet<String>>,
 }

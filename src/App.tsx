@@ -36,6 +36,9 @@ interface RecordingSummary {
   detectedLanguage: string | null;
   durationMs: number | null;
   title: string | null;
+  // Set once "Compress for web" has succeeded for this recording — persisted
+  // in the DB so the button's highlight survives an app restart.
+  compressedPath: string | null;
 }
 
 interface StopRecordingResult {
@@ -75,6 +78,18 @@ interface TranslationUpdate {
 
 interface ExportSubtitlesResult {
   paths: string[];
+}
+
+interface CompressionProgress {
+  recordingId: string;
+  progress: number; // 0.0..=1.0
+}
+
+interface CompressionFinished {
+  recordingId: string;
+  status: "done" | "failed";
+  outputPath: string | null;
+  message: string | null;
 }
 
 interface TranslationStateResult {
@@ -229,6 +244,14 @@ function FolderIcon() {
   );
 }
 
+function CompressIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M9 4v4a1 1 0 0 1-1 1H4M15 4v4a1 1 0 0 0 1 1h4M9 20v-4a1 1 0 0 0-1-1H4M15 20v-4a1 1 0 0 1 1-1h4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function DeleteIcon() {
   return (
     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
@@ -257,6 +280,7 @@ function App() {
   const [renaming, setRenaming] = useState(false);
   const [transcriptionProgress, setTranscriptionProgress] = useState<number | null>(null);
   const [exportedPaths, setExportedPaths] = useState<string[] | null>(null);
+  const [compressionProgress, setCompressionProgress] = useState<Record<string, number>>({});
   const [recordingsDir, setRecordingsDir] = useState<string>("");
   const recordingIdRef = useRef<string | null>(null);
 
@@ -504,6 +528,43 @@ function App() {
     };
   }, []);
 
+  // Compression progress/completion is keyed by recording id rather than
+  // `recordingIdRef.current` like transcription/translation progress -- a
+  // compress job can run for a recording other than the one currently
+  // selected in the pipeline panel, and the row-level progress badge in the
+  // recordings table needs to reflect that regardless of selection.
+  useEffect(() => {
+    const unlisten = listen<CompressionProgress>("compression-progress", (event) => {
+      setCompressionProgress((prev) => ({
+        ...prev,
+        [event.payload.recordingId]: event.payload.progress,
+      }));
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<CompressionFinished>("compression-finished", (event) => {
+      const { status, message } = event.payload;
+      setCompressionProgress((prev) => {
+        const next = { ...prev };
+        delete next[event.payload.recordingId];
+        return next;
+      });
+      // On success the backend also emits `recording-updated` with the
+      // persisted `compressedPath`, which is what drives the button's
+      // highlight -- no separate success message needed here.
+      if (status === "failed") {
+        setError(`Compression failed: ${message ?? "unknown error"}`);
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   // No `recordingId` on either event, unlike the ones above: while a
   // recording is in progress there's no DB recording id yet (one is only
   // minted in `stop_recording`), and this app only ever has one recording
@@ -673,6 +734,7 @@ function App() {
         detectedLanguage: null,
         durationMs: null,
         title: null,
+        compressedPath: null,
       });
       setTranscriptionProgress(null);
       refreshRecordings();
@@ -750,6 +812,15 @@ function App() {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleCompressRecording(recording: RecordingSummary) {
+    setError(null);
+    try {
+      await invoke("compress_recording", { recordingId: recording.id });
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -912,8 +983,29 @@ function App() {
                   <td>
                     {PIPELINE_LABEL[recording.status]}
                     {recording.detectedLanguage && ` (${recording.detectedLanguage})`}
+                    {compressionProgress[recording.id] !== undefined && (
+                      <span className="compress-progress">
+                        {" "}
+                        • Compressing {Math.round(compressionProgress[recording.id] * 100)}%
+                      </span>
+                    )}
                   </td>
                   <td className="row-actions" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      className={
+                        "icon-btn" + (recording.compressedPath ? " compressed" : "")
+                      }
+                      title={
+                        recording.compressedPath
+                          ? "Already compressed for web — click to re-compress"
+                          : "Compress for web (H.264, quality 27, 128kbps audio)"
+                      }
+                      aria-label="Compress for web"
+                      disabled={compressionProgress[recording.id] !== undefined}
+                      onClick={() => handleCompressRecording(recording)}
+                    >
+                      <CompressIcon />
+                    </button>
                     <button
                       className="icon-btn"
                       title="Open folder"

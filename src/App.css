@@ -196,6 +196,17 @@ h1 {
   min-width: 0;
 }
 
+.compress-progress {
+  color: #555;
+  font-size: 0.9em;
+}
+
+.icon-btn.compressed {
+  color: #2e7d32;
+  background-color: #e8f5e9;
+  border-color: #a5d6a7;
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;

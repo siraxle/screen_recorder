@@ -204,6 +204,19 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )
         .context("failed to apply migration to user_version 8")?;
     }
+    if version < 9 {
+        // "Compress for web" (HandBrakeCLI, see `compress.rs`) writes its
+        // output path here once a compression succeeds, so the recordings
+        // library can show a persistent "already compressed" indicator that
+        // survives an app restart rather than only lasting the session.
+        conn.execute_batch(
+            "
+            ALTER TABLE recordings ADD COLUMN compressed_path TEXT;
+            PRAGMA user_version = 9;
+            ",
+        )
+        .context("failed to apply migration to user_version 9")?;
+    }
     Ok(())
 }
 
@@ -320,6 +333,10 @@ pub struct RecordingSummary {
     pub detected_language: Option<String>,
     pub duration_ms: Option<i64>,
     pub title: Option<String>,
+    /// Path to the "compress for web" output (see `commands::compress_recording`),
+    /// once a compression has succeeded for this recording. `None` means it
+    /// has never been compressed.
+    pub compressed_path: Option<String>,
 }
 
 pub struct JobRow {
@@ -563,15 +580,15 @@ pub fn get_recording_video_path(conn: &Connection, recording_id: &str) -> Result
 
 pub fn get_recording_summary(conn: &Connection, recording_id: &str) -> Result<RecordingSummary> {
     conn.query_row(
-        "SELECT id, video_path, created_at, status, detected_language, duration_ms, title FROM recordings WHERE id = ?1",
+        "SELECT id, video_path, created_at, status, detected_language, duration_ms, title, compressed_path FROM recordings WHERE id = ?1",
         [recording_id],
         |row| {
             let status: String = row.get(3)?;
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, status, row.get::<_, Option<String>>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<String>>(6)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, status, row.get::<_, Option<String>>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?))
         },
     )
     .with_context(|| format!("recording {recording_id} not found"))
-    .and_then(|(id, video_path, created_at, status, detected_language, duration_ms, title)| {
+    .and_then(|(id, video_path, created_at, status, detected_language, duration_ms, title, compressed_path)| {
         Ok(RecordingSummary {
             id,
             video_path,
@@ -580,13 +597,14 @@ pub fn get_recording_summary(conn: &Connection, recording_id: &str) -> Result<Re
             detected_language,
             duration_ms,
             title,
+            compressed_path,
         })
     })
 }
 
 pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT id, video_path, created_at, status, detected_language, duration_ms, title
+        "SELECT id, video_path, created_at, status, detected_language, duration_ms, title, compressed_path
          FROM recordings ORDER BY created_at DESC",
     )?;
     let rows = stmt
@@ -599,12 +617,13 @@ pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     rows.into_iter()
-        .map(|(id, video_path, created_at, status, detected_language, duration_ms, title)| {
+        .map(|(id, video_path, created_at, status, detected_language, duration_ms, title, compressed_path)| {
             Ok(RecordingSummary {
                 id,
                 video_path,
@@ -613,9 +632,25 @@ pub fn list_recordings(conn: &Connection) -> Result<Vec<RecordingSummary>> {
                 detected_language,
                 duration_ms,
                 title,
+                compressed_path,
             })
         })
         .collect()
+}
+
+/// Persists (or clears) the "compress for web" output path (see
+/// `commands::compress_recording`) so the recordings library's highlighted
+/// compress button survives an app restart.
+pub fn set_recording_compressed_path(
+    conn: &Connection,
+    recording_id: &str,
+    path: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recordings SET compressed_path = ?1 WHERE id = ?2",
+        rusqlite::params![path, recording_id],
+    )?;
+    Ok(())
 }
 
 /// `None`/empty clears the custom title, falling back to the UI's default

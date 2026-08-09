@@ -1,5 +1,6 @@
 mod capture;
 mod commands;
+mod compress;
 mod db;
 mod hotkeys;
 mod llm;
@@ -76,6 +77,7 @@ pub fn run() {
                 job_tx,
                 translation_controls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 active_hotkey: tokio::sync::Mutex::new(None),
+                compressing: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             });
 
             // Registered after `manage` since `hotkeys::apply` needs
@@ -131,6 +133,7 @@ pub fn run() {
             commands::get_hotkey_settings,
             commands::set_hotkey_settings,
             commands::open_settings_window,
+            commands::compress_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

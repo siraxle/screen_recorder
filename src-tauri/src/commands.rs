@@ -5,6 +5,7 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
+use crate::compress;
 use crate::db::{self, RecordingSummary, Segment, Summary};
 use crate::hotkeys::{self, HotkeySettings};
 use crate::llm::{self, LlmSettings, ProviderKind};
@@ -760,4 +761,99 @@ pub async fn get_summary(
     db::with_db(&state.db, move |conn| db::get_summary(conn, &recording_id))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Runs the fixed "optimized for web" HandBrakeCLI preset (format: MP4 web
+/// optimized, scale: optimal size, H.264/x264 quality 27, AAC 128kbit/s)
+/// against a finished recording, writing `recording.web.mp4` alongside the
+/// original. Fire-and-forget: the encode runs in the background and reports
+/// progress/completion via the `compression-progress`/`compression-finished`
+/// events, since it can run far longer than a normal command round trip.
+#[tauri::command]
+pub async fn compress_recording(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    recording_id: String,
+) -> Result<(), String> {
+    {
+        let mut active = state.compressing.lock().await;
+        if !active.insert(recording_id.clone()) {
+            return Err("this recording is already being compressed".to_string());
+        }
+    }
+
+    let video_path = {
+        let rid = recording_id.clone();
+        match db::with_db(&state.db, move |conn| db::get_recording_video_path(conn, &rid)).await {
+            Ok(path) => path,
+            Err(e) => {
+                state.compressing.lock().await.remove(&recording_id);
+                return Err(e.to_string());
+            }
+        }
+    };
+    // "recording.mp4" -> "recording.web.mp4", saved alongside the original
+    // rather than replacing it.
+    let output_path = video_path.with_extension("web.mp4");
+
+    tauri::async_runtime::spawn(async move {
+        let progress_app = app.clone();
+        let progress_recording_id = recording_id.clone();
+        let result = compress::run_compression(&app, &video_path, &output_path, move |progress| {
+            let _ = progress_app.emit(
+                "compression-progress",
+                compress::CompressionProgress {
+                    recording_id: progress_recording_id.clone(),
+                    progress,
+                },
+            );
+        })
+        .await;
+
+        let state = app.state::<AppState>();
+        state.compressing.lock().await.remove(&recording_id);
+
+        let event = match result {
+            Ok(()) => {
+                // Persisted (rather than only held in frontend state) so the
+                // recordings library's highlighted compress button survives
+                // an app restart.
+                let rid = recording_id.clone();
+                let path_str = output_path.to_string_lossy().to_string();
+                let persisted = db::with_db(&state.db, {
+                    let rid = rid.clone();
+                    let path_str = path_str.clone();
+                    move |conn| db::set_recording_compressed_path(conn, &rid, Some(&path_str))
+                })
+                .await;
+                match persisted {
+                    Ok(()) => {
+                        if let Ok(summary) =
+                            db::with_db(&state.db, move |conn| db::get_recording_summary(conn, &rid)).await
+                        {
+                            let _ = app.emit("recording-updated", summary);
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "failed to persist compressed_path for recording {rid}: {e:#}"
+                    ),
+                }
+                compress::CompressionFinished {
+                    recording_id: recording_id.clone(),
+                    status: "done",
+                    output_path: Some(path_str),
+                    message: None,
+                }
+            }
+            Err(e) => compress::CompressionFinished {
+                recording_id: recording_id.clone(),
+                status: "failed",
+                output_path: None,
+                message: Some(format!("{e:#}")),
+            },
+        };
+        let _ = app.emit("compression-finished", event);
+    });
+
+    Ok(())
 }
