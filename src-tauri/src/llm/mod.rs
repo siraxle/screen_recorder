@@ -231,6 +231,49 @@ pub async fn complete(
     Ok(content)
 }
 
+/// Human-readable name for an ISO 639-1 code, for prompts sent to local
+/// models — small/local models frequently don't reliably map a bare code
+/// like "ru" to "Russian" and default to the transcript's language instead,
+/// so prompts should spell the language out rather than relying on the code
+/// alone. Falls back to the raw code (covers the frontend's free-text
+/// "Other" option) for anything not in this list.
+pub fn language_display_name(code: &str) -> String {
+    let name = match code {
+        "en" => "English",
+        "ru" => "Russian",
+        "uk" => "Ukrainian",
+        "es" => "Spanish",
+        "de" => "German",
+        "fr" => "French",
+        "it" => "Italian",
+        "pt" => "Portuguese",
+        "nl" => "Dutch",
+        "pl" => "Polish",
+        "cs" => "Czech",
+        "sk" => "Slovak",
+        "sl" => "Slovenian",
+        "hr" => "Croatian",
+        "hu" => "Hungarian",
+        "ro" => "Romanian",
+        "bg" => "Bulgarian",
+        "el" => "Greek",
+        "da" => "Danish",
+        "sv" => "Swedish",
+        "fi" => "Finnish",
+        "et" => "Estonian",
+        "lv" => "Latvian",
+        "lt" => "Lithuanian",
+        "zh" => "Chinese",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "ar" => "Arabic",
+        "hi" => "Hindi",
+        "tr" => "Turkish",
+        other => return other.to_string(),
+    };
+    name.to_string()
+}
+
 /// F8: translates a single subtitle segment's text. Called once per segment
 /// (not on the concatenated transcript) so a failure only drops one cue —
 /// see CLAUDE.md's "translate segment-by-segment ... so timecodes stay
@@ -244,11 +287,13 @@ pub async fn translate_segment(
     source_language: &str,
     target_language: &str,
 ) -> Result<String, ProviderError> {
+    let source_name = language_display_name(source_language);
+    let target_name = language_display_name(target_language);
     let system = format!(
-        "You translate subtitle lines from the language with ISO 639-1 code \
-         \"{source_language}\" to the language with ISO 639-1 code \
-         \"{target_language}\". Respond with ONLY the translated line — no \
-         quotes, no explanation, no original text — preserving tone and meaning."
+        "You translate subtitle lines from {source_name} (ISO 639-1: \"{source_language}\") \
+         to {target_name} (ISO 639-1: \"{target_language}\"). Respond with ONLY the \
+         translated line, written in {target_name} — no quotes, no explanation, no \
+         original text — preserving tone and meaning."
     );
     let reply = complete(settings, cloud_token, &system, text).await?;
     Ok(reply.trim().to_string())

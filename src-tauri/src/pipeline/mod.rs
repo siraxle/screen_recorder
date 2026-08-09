@@ -389,12 +389,30 @@ async fn run_summarization(
         .map(|s| s.text.trim())
         .collect::<Vec<_>>()
         .join(" ");
+    let language_name = llm::language_display_name(&target_language);
     let system_prompt = format!(
         "You summarize meeting/lecture transcripts. Respond ONLY with a JSON \
-         object of the shape {{\"overview\": string, \"key_points\": string[]}} \
-         — a short overview plus a list of key points. Write the summary in \
-         the language with ISO 639-1 code \"{target_language}\", regardless \
-         of the transcript's language."
+         object of the shape {{\"overview\": string, \"key_points\": string[]}}. \
+         Be thorough and complete rather than brief: \
+         \"overview\" should be several sentences (a short paragraph, not one \
+         or two lines) that walks through the topics discussed in the order \
+         they came up, including relevant context, reasoning, and any \
+         conclusions reached — not just a one-line gist. \"key_points\" should \
+         enumerate every distinct decision, action item, open question, and \
+         noteworthy fact from the transcript as its own entry — do not \
+         collapse multiple points into one entry, and do not cap the list to \
+         a small handful if the transcript covers more ground than that. \
+         Prefer including a point over omitting it; only leave out filler \
+         and small talk that carries no information. \
+         IMPORTANT: write the ENTIRE reply — the \"overview\" text and every \
+         \"key_points\" entry — in {language_name} (ISO 639-1: \"{target_language}\"). \
+         Do this even though the transcript below is in a different language, \
+         and even if that means translating rather than just summarizing in \
+         the original language. Never answer in the transcript's own language \
+         unless it happens to be {language_name}."
+    );
+    let transcript_text = format!(
+        "{transcript_text}\n\n(Reminder: respond only in {language_name}.)"
     );
 
     if settings.provider == llm::ProviderKind::Local {
