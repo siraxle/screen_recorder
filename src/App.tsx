@@ -213,6 +213,31 @@ function displayName(recording: RecordingSummary): string {
   return recording.title || formatCreatedAt(recording.createdAt);
 }
 
+function RenameIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l2 2.5h9A1.5 1.5 0 0 1 21 9v9.5A1.5 1.5 0 0 1 19.5 20h-15A1.5 1.5 0 0 1 3 18.5Z" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function DeleteIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M4 7h16M9 7V4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V7m2 0v12.5A1.5 1.5 0 0 1 15.5 21h-7A1.5 1.5 0 0 1 7 19.5V7" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10 11v6M14 11v6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function App() {
   const [status, setStatus] = useState<RecordingStatus>("stopped");
   const [microphones, setMicrophones] = useState<string[]>([]);
@@ -870,8 +895,15 @@ function App() {
                       </span>
                     ) : (
                       <span className="row-actions">
-                        {displayName(recording)}
-                        <button onClick={() => startEditingTitle(recording)}>Rename</button>
+                        <span className="recording-name">{displayName(recording)}</span>
+                        <button
+                          className="icon-btn"
+                          title="Rename"
+                          aria-label="Rename"
+                          onClick={() => startEditingTitle(recording)}
+                        >
+                          <RenameIcon />
+                        </button>
                       </span>
                     )}
                   </td>
@@ -882,8 +914,18 @@ function App() {
                     {recording.detectedLanguage && ` (${recording.detectedLanguage})`}
                   </td>
                   <td className="row-actions" onClick={(e) => e.stopPropagation()}>
-                    <button onClick={() => handleOpenRecordingFolder(recording)}>Open folder</button>
                     <button
+                      className="icon-btn"
+                      title="Open folder"
+                      aria-label="Open folder"
+                      onClick={() => handleOpenRecordingFolder(recording)}
+                    >
+                      <FolderIcon />
+                    </button>
+                    <button
+                      className="icon-btn"
+                      title="Delete"
+                      aria-label="Delete"
                       disabled={
                         recording.status === "transcribing" ||
                         recording.status === "summarizing" ||
@@ -891,7 +933,7 @@ function App() {
                       }
                       onClick={() => handleDeleteRecording(recording)}
                     >
-                      Delete
+                      <DeleteIcon />
                     </button>
                   </td>
                 </tr>
