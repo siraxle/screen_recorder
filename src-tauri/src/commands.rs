@@ -857,7 +857,7 @@ pub async fn set_live_subtitle_settings(
 /// tab opens, not just once at startup.
 #[tauri::command]
 pub async fn check_dependencies(app: tauri::AppHandle) -> Result<crate::setup::DependencyReport, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
     Ok(crate::setup::check_all(&dir).await)
 }
 
@@ -882,7 +882,7 @@ pub async fn install_dependencies(
         *installing = true;
     }
 
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
     let progress_app = app.clone();
     let result = crate::setup::install(&dir, &targets, move |progress| {
         let _ = progress_app.emit("dependency-install-progress", &progress);
@@ -929,14 +929,14 @@ pub async fn use_dependency_path(
     path: String,
     source: crate::setup::DependencySource,
 ) -> Result<crate::setup::DependencyReport, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let app_data_dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
     let folder = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || crate::setup::apply_override(&app_data_dir, id, &folder, source))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
 
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
     let report = crate::setup::check_all(&dir).await;
     let _ = app.emit("dependencies-changed", &report);
     Ok(report)
@@ -949,13 +949,13 @@ pub async fn clear_dependency_override(
     app: tauri::AppHandle,
     id: crate::setup::DependencyId,
 ) -> Result<crate::setup::DependencyReport, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let app_data_dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || crate::setup::clear_override(&app_data_dir, id))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
 
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
     let report = crate::setup::check_all(&dir).await;
     let _ = app.emit("dependencies-changed", &report);
     Ok(report)

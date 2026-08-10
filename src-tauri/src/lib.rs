@@ -6,6 +6,7 @@ mod hotkeys;
 mod llm;
 mod overlay;
 mod pipeline;
+mod portable;
 mod settings_window;
 mod setup;
 mod state;
@@ -39,7 +40,7 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()?;
+            let app_data_dir = portable::app_data_dir(app)?;
             let db_path = app_data_dir.join("db.sqlite3");
             let db = db::open(&db_path).expect("failed to open recordings database");
 

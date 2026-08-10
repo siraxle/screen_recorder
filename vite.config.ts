@@ -25,8 +25,11 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri` and the portable-build
+      // output dir -- an exe under `dist-portable` being transiently locked
+      // (in use, or scanned by antivirus) has crashed the whole dev server
+      // with an unhandled EBUSY from chokidar before.
+      ignored: ["**/src-tauri/**", "**/dist-portable/**"],
     },
   },
 }));
