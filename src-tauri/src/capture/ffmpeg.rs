@@ -47,10 +47,20 @@ pub async fn run_to_completion(mut cmd: Command, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Builds the ffmpeg process that records one segment: desktop video via
+/// Builds the ffmpeg process that records one segment's desktop video via
 /// gdigrab, plus the microphone via dshow if enabled. System audio is
 /// captured separately (see `system_audio.rs`, WASAPI has no ffmpeg/dshow
 /// path on stock Windows) and muxed in afterwards by `build_mux_command`.
+///
+/// This is deliberately webcam-agnostic (see `build_webcam_segment_command`
+/// and `build_webcam_composite_command` for F16): compositing the webcam
+/// live, in the same process, meant this filter graph had to keep pace with
+/// two independently-paced real-time devices (gdigrab + dshow) or the whole
+/// recording would stutter waiting on whichever device was slower. Capturing
+/// each device into its own plain, filter-free process and compositing them
+/// together *after* the segment stops removes that real-time coupling
+/// entirely, so a plain screen recording (and, transitively, the desktop
+/// track of a webcam recording) is unaffected by the feature's existence.
 ///
 /// `+frag_keyframe+empty_moov` makes the mp4 playable even if the process is
 /// killed instead of stopped gracefully — segment boundaries (pause/resume)
@@ -58,68 +68,31 @@ pub async fn run_to_completion(mut cmd: Command, label: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Command {
     let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
-    cmd.arg("-y")
-        .arg("-f")
-        .arg("gdigrab")
-        .arg("-framerate")
+    cmd.arg("-y").arg("-f").arg("gdigrab");
+    if config.webcam.enabled {
+        // Only needed when a webcam track will later be composited against
+        // this one (see `build_webcam_composite_command`) -- tags each frame
+        // with real wall-clock time instead of an assumed-continuous
+        // frame-index PTS, which is what lets the offline compose pass align
+        // two independently-started capture processes correctly.
+        cmd.arg("-use_wallclock_as_timestamps").arg("1");
+    }
+    cmd.arg("-framerate")
         .arg(config.framerate.to_string())
         .arg("-i")
         .arg("desktop");
 
-    // Track input indices as optional inputs are added below (desktop is
-    // always input 0), so the F16 webcam-overlay filter graph and the
-    // (explicit, once -filter_complex is in play) audio -map can reference
-    // the right stream regardless of which combination of mic/webcam is
-    // enabled this session.
-    let mut next_input_index: usize = 1;
-
-    let webcam_index = if config.webcam.enabled {
-        // dshow has no "use OS default" device name; callers must resolve a
-        // concrete device (see `CaptureController::begin_segment`) before
-        // this is invoked, same as the microphone below.
-        let device = config
-            .webcam
-            .device
-            .as_deref()
-            .expect("webcam.enabled requires a resolved webcam.device");
-        cmd.arg("-f")
-            .arg("dshow")
-            .arg("-framerate")
-            .arg(config.framerate.to_string())
-            .arg("-i")
-            .arg(format!("video={device}"));
-        let idx = next_input_index;
-        next_input_index += 1;
-        Some(idx)
-    } else {
-        None
-    };
-
-    let mic_index = if config.capture_microphone {
+    if config.capture_microphone {
         let mic = config
             .microphone_device
             .as_deref()
             .expect("capture_microphone requires a resolved microphone_device");
-        cmd.arg("-f")
+        cmd.arg("-thread_queue_size")
+            .arg("1024")
+            .arg("-f")
             .arg("dshow")
             .arg("-i")
             .arg(format!("audio={mic}"));
-        Some(next_input_index)
-    } else {
-        None
-    };
-
-    // Without the webcam overlay, stream mapping stays fully implicit
-    // (ffmpeg's default "one stream per type" selection), exactly matching
-    // this command's shape before F16 -- so a recording with the overlay
-    // disabled is byte-for-byte unaffected by this feature's existence.
-    if let Some(cam_idx) = webcam_index {
-        cmd.arg("-filter_complex")
-            .arg(build_webcam_overlay_filter(cam_idx, &config.webcam));
-        cmd.arg("-map").arg("[outv]");
-        if let Some(mic_idx) = mic_index {
-            cmd.arg("-map").arg(format!("{mic_idx}:a"));
-        }
     }
 
     cmd.arg("-c:v")
@@ -142,27 +115,149 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
     cmd
 }
 
-/// Builds the F16 webcam-overlay filter graph: crops the webcam feed to a
-/// square, scales it to a fixed fraction of the desktop capture's own width
-/// (via `scale2ref`, so this never needs to query the desktop's actual
-/// resolution), optionally masks it into a circle, then overlays it onto the
-/// desktop video in the configured corner with a fixed margin.
+/// Builds the F16 webcam capture process: just the raw camera feed via
+/// dshow, encoded with no filter graph, run as its own process alongside
+/// `build_segment_command`'s desktop capture. Kept maximally simple (single
+/// input, no filters) so it can never be the thing that makes the *desktop*
+/// capture fall behind -- the two devices no longer share a process or a
+/// filter graph at all, only a compositing pass after they've both stopped
+/// (see `build_webcam_composite_command`).
 #[cfg(target_os = "windows")]
-fn build_webcam_overlay_filter(cam_index: usize, webcam: &WebcamOverlayConfig) -> String {
+pub fn build_webcam_segment_command(config: &CaptureConfig, output_path: &Path) -> Command {
+    let device = config
+        .webcam
+        .device
+        .as_deref()
+        .expect("webcam.enabled requires a resolved webcam.device");
+    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    cmd.arg("-y")
+        .arg("-thread_queue_size")
+        .arg("1024")
+        .arg("-use_wallclock_as_timestamps")
+        .arg("1")
+        .arg("-f")
+        .arg("dshow")
+        .arg("-framerate")
+        .arg(config.framerate.to_string())
+        .arg("-i")
+        .arg(format!("video={device}"))
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("ultrafast")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+frag_keyframe+empty_moov")
+        .arg(output_path);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Builds the F16 offline compositing pass: takes the already-finished
+/// desktop segment and webcam segment (see `build_segment_command` and
+/// `build_webcam_segment_command`) and merges them into one video -- crops
+/// the webcam feed to a square, optionally masks it into a circle, scales it
+/// to a fixed fraction of the desktop's own width (via `scale2ref`, so this
+/// never needs to query the desktop's actual resolution), and overlays it
+/// onto the desktop video in the configured corner with a fixed margin.
+///
+/// Runs *after* the segment stops, not live, so unlike the old single-process
+/// design it isn't racing either device's real-time frame delivery -- ffmpeg
+/// processes both files as fast as the CPU allows, which is what actually
+/// fixes the choppiness (the live version could stall the whole recording
+/// waiting on whichever of gdigrab/dshow produced its next frame slower).
+///
+/// `desktop_offset_secs`/`webcam_offset_secs` come from wall-clock instants
+/// the caller recorded immediately before spawning each process (see
+/// `CaptureController::begin_segment`); combined with
+/// `-use_wallclock_as_timestamps` on both live captures and `-copyts` here,
+/// they align the two independently-started files to a shared time base
+/// instead of assuming both happened to start at the same instant (dshow
+/// device negotiation is often a few hundred ms slower than gdigrab).
+///
+/// Masking happens before the final upscale, not after, so the per-pixel
+/// `geq` circle mask always runs on a small `MASK_SIZE`-square frame instead
+/// of the full displayed overlay size -- cheap and constant-cost regardless
+/// of desktop resolution or the configured size fraction, which matters more
+/// now that this can run at a higher-quality preset without a real-time
+/// budget to protect.
+#[cfg(target_os = "windows")]
+pub fn build_webcam_composite_command(
+    desktop_path: &Path,
+    webcam_path: &Path,
+    webcam: &WebcamOverlayConfig,
+    desktop_offset_secs: f64,
+    webcam_offset_secs: f64,
+    has_mic_track: bool,
+    output_path: &Path,
+) -> Command {
+    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    cmd.arg("-y").arg("-copyts");
+    if desktop_offset_secs > 0.0 {
+        cmd.arg("-itsoffset").arg(format!("{desktop_offset_secs:.3}"));
+    }
+    cmd.arg("-i").arg(desktop_path);
+    if webcam_offset_secs > 0.0 {
+        cmd.arg("-itsoffset").arg(format!("{webcam_offset_secs:.3}"));
+    }
+    cmd.arg("-i").arg(webcam_path);
+
+    cmd.arg("-filter_complex").arg(build_webcam_overlay_filter(webcam));
+    cmd.arg("-map").arg("[outv]");
+    if has_mic_track {
+        cmd.arg("-map").arg("0:a");
+    }
+
+    cmd.arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("ultrafast")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+frag_keyframe+empty_moov");
+    if has_mic_track {
+        cmd.arg("-c:a").arg("copy");
+    }
+    cmd.arg(output_path);
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Builds the F16 webcam-overlay filter graph used by
+/// `build_webcam_composite_command`. Input 0 is always the desktop segment
+/// and input 1 is always the webcam segment -- fixed indices, since (unlike
+/// the old single live process) the two are always separate files composed
+/// in a known order.
+#[cfg(target_os = "windows")]
+fn build_webcam_overlay_filter(webcam: &WebcamOverlayConfig) -> String {
     // Fixed rather than user-configurable -- the user asked for corner and
     // shape to be pickable, not a size slider; both can become settings
-    // later if wanted. 0.45 = 2.5x the original 0.18 default.
-    const SIZE_FRACTION: &str = "0.45";
-    const MARGIN_PX: i32 = 24;
+    // later if wanted.
+    const SIZE_FRACTION: &str = "0.16";
+    const MARGIN_PX: i32 = 8;
+    // Resolution the circle mask is computed at, independent of the final
+    // displayed size -- keeps the geq cost constant regardless of desktop
+    // resolution or SIZE_FRACTION.
+    const MASK_SIZE: i32 = 256;
 
     let mask = match webcam.shape {
-        // Hard-edge circular alpha mask (no feathering) -- simple and cheap
-        // enough on an already-small (scaled-down) frame.
+        // Hard-edge circular alpha mask (no feathering) -- computed at the
+        // small, fixed MASK_SIZE so cost doesn't scale with desktop
+        // resolution or the configured overlay size.
         WebcamShape::Circle => {
-            "[camscaled]format=yuva420p,geq=lum='p(X,Y)':a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)'[camfinal]"
-                .to_string()
+            format!(
+                "[camsq]scale={MASK_SIZE}:{MASK_SIZE}[cammasksrc];\
+                 [cammasksrc]format=yuva420p,geq=lum='p(X,Y)':a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)'[camfinal]"
+            )
         }
-        WebcamShape::Square => "[camscaled]copy[camfinal]".to_string(),
+        WebcamShape::Square => "[camsq]copy[camfinal]".to_string(),
     };
 
     let (x, y) = match webcam.corner {
@@ -175,15 +270,37 @@ fn build_webcam_overlay_filter(cam_index: usize, webcam: &WebcamOverlayConfig) -
     };
 
     format!(
-        "[{cam_index}:v]crop='min(iw,ih)':'min(iw,ih)'[camsq];\
-         [camsq][0:v]scale2ref=w=main_w*{SIZE_FRACTION}:h=main_w*{SIZE_FRACTION}[camscaled][mainref];\
+        "[1:v]crop='min(iw,ih)':'min(iw,ih)'[camsq];\
          {mask};\
-         [mainref][camfinal]overlay={x}:{y}[outv]"
+         [camfinal][0:v]scale2ref=w=ref_w*{SIZE_FRACTION}:h=ref_w*{SIZE_FRACTION}[camscaled][mainref];\
+         [mainref][camscaled]overlay={x}:{y}[outv]"
     )
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn build_segment_command(_config: &CaptureConfig, _output_path: &Path) -> Command {
+    unimplemented!(
+        "screen capture is only implemented for Windows in this prototype (Week 1 milestone scope, see roadmap in screen-recorder-spec.md)"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn build_webcam_segment_command(_config: &CaptureConfig, _output_path: &Path) -> Command {
+    unimplemented!(
+        "screen capture is only implemented for Windows in this prototype (Week 1 milestone scope, see roadmap in screen-recorder-spec.md)"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn build_webcam_composite_command(
+    _desktop_path: &Path,
+    _webcam_path: &Path,
+    _webcam: &WebcamOverlayConfig,
+    _desktop_offset_secs: f64,
+    _webcam_offset_secs: f64,
+    _has_mic_track: bool,
+    _output_path: &Path,
+) -> Command {
     unimplemented!(
         "screen capture is only implemented for Windows in this prototype (Week 1 milestone scope, see roadmap in screen-recorder-spec.md)"
     )

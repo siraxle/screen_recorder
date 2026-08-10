@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -25,6 +26,15 @@ pub enum RecordingStatus {
 struct ActiveSegment {
     video_child: Child,
     video_path: PathBuf,
+    video_start: Instant,
+    /// F16: the webcam feed is captured by its own plain, filter-free ffmpeg
+    /// process (see `ffmpeg::build_webcam_segment_command`) rather than
+    /// composited live alongside the desktop capture -- two independent
+    /// real-time devices sharing one filter graph is what made the old
+    /// design stutter waiting on whichever was slower. `webcam_start` is
+    /// used to align the two files in the post-stop compositing pass (see
+    /// `finish_segment`).
+    webcam: Option<(Child, PathBuf, Instant)>,
     loopback: Option<LoopbackCapture>,
     loopback_pcm_path: Option<PathBuf>,
     has_mic_track: bool,
@@ -169,12 +179,36 @@ impl CaptureController {
         }
 
         let mut cmd = ffmpeg::build_segment_command(&self.config, &video_path);
+        let video_start = Instant::now();
         let mut video_child = cmd
             .spawn()
             .context("failed to spawn ffmpeg for video/mic capture")?;
         if let Some(stderr) = video_child.stderr.take() {
             ffmpeg::spawn_stderr_drain(stderr, format!("segment-{}", self.segment_index));
         }
+
+        // F16: webcam is its own process (see `ActiveSegment::webcam` doc
+        // comment) so it's spawned right alongside the desktop capture
+        // rather than as a second input inside the same command.
+        let webcam = if self.config.webcam.enabled {
+            let webcam_path = self
+                .work_dir
+                .join(format!("segment-{:03}-webcam.mp4", self.segment_index));
+            let mut webcam_cmd = ffmpeg::build_webcam_segment_command(&self.config, &webcam_path);
+            let webcam_start = Instant::now();
+            let mut webcam_child = webcam_cmd
+                .spawn()
+                .context("failed to spawn ffmpeg for webcam capture")?;
+            if let Some(stderr) = webcam_child.stderr.take() {
+                ffmpeg::spawn_stderr_drain(
+                    stderr,
+                    format!("segment-{}-webcam", self.segment_index),
+                );
+            }
+            Some((webcam_child, webcam_path, webcam_start))
+        } else {
+            None
+        };
 
         let (loopback, loopback_pcm_path) = if self.config.capture_system_audio {
             let pcm_path = self.work_dir.join(format!(
@@ -190,6 +224,8 @@ impl CaptureController {
         self.active = Some(ActiveSegment {
             video_child,
             video_path,
+            video_start,
+            webcam,
             loopback,
             loopback_pcm_path,
             has_mic_track: self.config.capture_microphone,
@@ -219,6 +255,60 @@ impl CaptureController {
             ));
         }
 
+        // F16: composite the webcam feed onto the desktop video now that
+        // both have stopped, rather than live during capture -- see
+        // `ffmpeg::build_webcam_composite_command` for why running this
+        // offline (not racing either device's real-time frame delivery) is
+        // what actually fixes the choppiness.
+        let video_path = match segment.webcam.take() {
+            Some((mut webcam_child, webcam_path, webcam_start)) => {
+                if let Some(mut stdin) = webcam_child.stdin.take() {
+                    let _ = stdin.write_all(b"q").await;
+                }
+                let webcam_status = webcam_child
+                    .wait()
+                    .await
+                    .context("failed to wait for webcam ffmpeg process")?;
+                if !webcam_status.success() {
+                    return Err(anyhow!(
+                        "ffmpeg (webcam capture) exited with status {webcam_status}"
+                    ));
+                }
+
+                // Neither process is guaranteed to start first -- gdigrab
+                // usually starts almost immediately while dshow device
+                // negotiation can lag by hundreds of ms, but that's not
+                // guaranteed either. Whichever started later gets offset 0;
+                // the earlier one is delayed by the measured gap so both
+                // align to a shared time base in the compose pass.
+                let min_start = segment.video_start.min(webcam_start);
+                let desktop_offset = segment
+                    .video_start
+                    .saturating_duration_since(min_start)
+                    .as_secs_f64();
+                let webcam_offset = webcam_start.saturating_duration_since(min_start).as_secs_f64();
+
+                let composited_path = self
+                    .work_dir
+                    .join(format!("segment-{:03}-composited.mp4", self.segment_index));
+                ffmpeg::run_to_completion(
+                    ffmpeg::build_webcam_composite_command(
+                        &segment.video_path,
+                        &webcam_path,
+                        &self.config.webcam,
+                        desktop_offset,
+                        webcam_offset,
+                        segment.has_mic_track,
+                        &composited_path,
+                    ),
+                    "webcam-composite",
+                )
+                .await?;
+                composited_path
+            }
+            None => segment.video_path.clone(),
+        };
+
         match segment.loopback_pcm_path {
             Some(pcm_path) => {
                 let muxed_path = self
@@ -226,7 +316,7 @@ impl CaptureController {
                     .join(format!("segment-{:03}-final.mp4", self.segment_index));
                 ffmpeg::run_to_completion(
                     ffmpeg::build_mux_command(
-                        &segment.video_path,
+                        &video_path,
                         &pcm_path,
                         segment.has_mic_track,
                         &muxed_path,
@@ -236,7 +326,7 @@ impl CaptureController {
                 .await?;
                 Ok(muxed_path)
             }
-            None => Ok(segment.video_path),
+            None => Ok(video_path),
         }
     }
 }
