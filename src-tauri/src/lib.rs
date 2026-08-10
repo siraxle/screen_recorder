@@ -7,6 +7,7 @@ mod llm;
 mod overlay;
 mod pipeline;
 mod settings_window;
+mod setup;
 mod state;
 mod subtitle;
 mod thermal;
@@ -54,6 +55,25 @@ pub fn run() {
                 .unwrap_or_else(|| app_data_dir.join("recordings"));
             std::fs::create_dir_all(&recordings_dir)?;
 
+            // Cache the resolved interpreter/ffmpeg paths once, up front --
+            // `setup::paths::python_program`/`ffmpeg_program`/`ffprobe_program`
+            // fall back to the bare PATH-relative literal until this runs.
+            // Resolves to a saved system/custom override (see `setup::overrides`)
+            // if one is set and still valid, else the bundled `runtime/`
+            // path, regardless of whether that component has actually been
+            // installed yet (a job spawned before install just fails clearly,
+            // same as today's "not on PATH" failure mode). `apply_override`/
+            // `clear_override` re-run this same resolution at runtime when
+            // the user changes their choice from the Dependencies panel.
+            setup::resolve_startup_paths(&app_data_dir);
+            let priming_data_dir = app_data_dir.clone();
+            tauri::async_runtime::spawn(async move {
+                let report = setup::check_all(&priming_data_dir).await;
+                if !report.required_satisfied() {
+                    tracing::info!("required runtime dependencies not yet installed -- the frontend will prompt for setup");
+                }
+            });
+
             let hotkey_settings = {
                 let conn = db.lock().expect("db mutex poisoned");
                 hotkeys::load_settings(&conn)?
@@ -78,6 +98,7 @@ pub fn run() {
                 translation_controls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 active_hotkey: tokio::sync::Mutex::new(None),
                 compressing: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+                installing: tokio::sync::Mutex::new(false),
             });
 
             // Registered after `manage` since `hotkeys::apply` needs
@@ -136,6 +157,12 @@ pub fn run() {
             commands::set_hotkey_settings,
             commands::open_settings_window,
             commands::compress_recording,
+            commands::check_dependencies,
+            commands::install_dependencies,
+            commands::scan_dependencies,
+            commands::pick_dependency_folder,
+            commands::use_dependency_path,
+            commands::clear_dependency_override,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

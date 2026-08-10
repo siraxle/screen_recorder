@@ -307,7 +307,7 @@ async fn run_transcription(
         let rid = recording_id.to_string();
         db::with_db(db, move |conn| db::get_recording_language_override(conn, &rid)).await?
     };
-    let stt_engine = db::with_db(db, |conn| stt::load_settings(conn)).await?.engine;
+    let stt_settings = db::with_db(db, |conn| stt::load_settings(conn)).await?;
 
     let wav_path = video_path.with_extension("stt.wav");
     ffmpeg::run_to_completion(
@@ -316,8 +316,14 @@ async fn run_transcription(
     )
     .await?;
 
-    let result =
-        stt::transcribe(&wav_path, language_override.as_deref(), stt_engine, on_progress).await;
+    let result = stt::transcribe(
+        &wav_path,
+        language_override.as_deref(),
+        stt_settings.engine,
+        stt_settings.device,
+        on_progress,
+    )
+    .await;
     let _ = std::fs::remove_file(&wav_path);
     let result = result?;
 

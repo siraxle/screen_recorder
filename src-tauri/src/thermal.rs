@@ -42,6 +42,17 @@ fn parse_temp_output(stdout: &str) -> Option<u32> {
 /// Reads the current GPU temperature via `nvidia-smi`. Returns `Ok(None)`
 /// (not an error) when `nvidia-smi` isn't on PATH or fails to run, so
 /// non-NVIDIA machines never get blocked by this best-effort check.
+/// Cheap "is there an NVIDIA GPU at all" check, reused by `setup::check_all`
+/// (deciding whether to offer the GPU pip extras) and by STT's `Auto` device
+/// resolution (deciding whether to pick `cuda`). Wraps the same `nvidia-smi`
+/// presence probe `read_gpu_temp_celsius` already does -- a `None` reading
+/// already means "no nvidia-smi / no GPU," this just names that as a bool so
+/// callers that don't care about the actual temperature don't have to spawn
+/// a second `nvidia-smi` process.
+pub async fn gpu_present() -> bool {
+    read_gpu_temp_celsius().await.is_some()
+}
+
 async fn read_gpu_temp_celsius() -> Option<u32> {
     let output = tokio::process::Command::new("nvidia-smi")
         .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])

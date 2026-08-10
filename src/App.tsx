@@ -3,7 +3,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { EVENT_CLOSED, EVENT_OPENED } from "./annotation/types";
-import { EVENT_STT_SETTINGS_CHANGED, type SttSettings } from "./settings/types";
+import {
+  EVENT_DEPENDENCIES_CHANGED,
+  EVENT_STT_SETTINGS_CHANGED,
+  requiredDependenciesSatisfied,
+  type DependencyReport,
+  type SttSettings,
+} from "./settings/types";
+import DependencyPanel from "./setup/DependencyPanel";
 import "./App.css";
 
 type RecordingStatus = "recording" | "paused" | "stopped";
@@ -288,7 +295,7 @@ function App() {
   const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
   const [searching, setSearching] = useState(false);
 
-  const [sttSettings, setSttSettings] = useState<SttSettings>({ engine: "whisper" });
+  const [sttSettings, setSttSettings] = useState<SttSettings>({ engine: "whisper", device: "auto" });
 
   const [liveSubtitlesEnabled, setLiveSubtitlesEnabled] = useState(false);
   const [liveCaption, setLiveCaption] = useState<string>("");
@@ -329,6 +336,23 @@ function App() {
     invoke<SttSettings>("get_stt_settings")
       .then(setSttSettings)
       .catch((e) => setError(String(e)));
+  }, []);
+
+  const [depReport, setDepReport] = useState<DependencyReport | null>(null);
+
+  useEffect(() => {
+    invoke<DependencyReport>("check_dependencies")
+      .then(setDepReport)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<DependencyReport>(EVENT_DEPENDENCIES_CHANGED, (event) => {
+      setDepReport(event.payload);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
   }, []);
 
   useEffect(() => {
@@ -879,6 +903,23 @@ function App() {
       })
     );
     if (result) setExportedPaths(result.paths);
+  }
+
+  if (depReport && !requiredDependenciesSatisfied(depReport)) {
+    return (
+      <main className="container">
+        <div className="header-row">
+          <div>
+            <h1>Screen Recorder — Capture Prototype</h1>
+            <p className="subtitle">
+              Before recording, install the required components below.
+            </p>
+          </div>
+        </div>
+        {error && <p className="error">{error}</p>}
+        <DependencyPanel onReport={setDepReport} />
+      </main>
+    );
   }
 
   return (

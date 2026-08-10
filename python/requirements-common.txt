@@ -1,0 +1,16 @@
+# Installed on every machine, regardless of GPU presence (see
+# src-tauri/src/setup/python_runtime.rs). Keep GPU-only packages out of this
+# file -- they live in requirements-gpu.txt and are only installed when an
+# NVIDIA GPU is actually detected.
+
+faster-whisper>=1.2
+
+# NVIDIA Parakeet-TDT-0.6B-v3 (see parakeet_worker.py), run through ONNX
+# Runtime instead of NeMo. `hub` enables the automatic Hugging Face download
+# `onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3")` does on first use (same
+# on-demand-download convenience as faster-whisper's model cache). The `gpu`
+# extra (onnxruntime-gpu) is intentionally NOT included here -- it's added by
+# requirements-gpu.txt on machines with a detected NVIDIA GPU; without it,
+# onnx-asr runs CPUExecutionProvider only (see parakeet_worker.py's provider
+# list comment).
+onnx-asr[hub]>=0.9

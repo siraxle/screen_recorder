@@ -27,19 +27,36 @@ pub enum SttEngine {
     Parakeet,
 }
 
+/// STT compute device preference. `Auto` (the default) only picks `cuda`
+/// when both an NVIDIA GPU is physically present *and* the optional GPU pip
+/// extras are actually installed (see `resolve_device_from`) -- a GPU being
+/// present with the extras never installed would otherwise crash on missing
+/// cuBLAS/cuDNN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceSetting {
+    #[default]
+    Auto,
+    Cuda,
+    Cpu,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SttSettings {
     pub engine: SttEngine,
+    #[serde(default)]
+    pub device: DeviceSetting,
 }
 
 impl Default for SttSettings {
     fn default() -> Self {
-        Self { engine: SttEngine::Whisper }
+        Self { engine: SttEngine::Whisper, device: DeviceSetting::Auto }
     }
 }
 
 const KEY_STT_ENGINE: &str = "stt_engine";
+const KEY_STT_DEVICE: &str = "stt_device";
 
 /// Loads STT engine settings from the generic `settings` key/value table,
 /// mirroring `llm::load_settings`'s fallback-to-default convention.
@@ -48,7 +65,12 @@ pub fn load_settings(conn: &Connection) -> Result<SttSettings> {
         Some("parakeet") => SttEngine::Parakeet,
         _ => SttEngine::Whisper,
     };
-    Ok(SttSettings { engine })
+    let device = match db::get_setting(conn, KEY_STT_DEVICE)?.as_deref() {
+        Some("cuda") => DeviceSetting::Cuda,
+        Some("cpu") => DeviceSetting::Cpu,
+        _ => DeviceSetting::Auto,
+    };
+    Ok(SttSettings { engine, device })
 }
 
 pub fn save_settings(conn: &Connection, settings: &SttSettings) -> Result<()> {
@@ -57,7 +79,44 @@ pub fn save_settings(conn: &Connection, settings: &SttSettings) -> Result<()> {
         SttEngine::Parakeet => "parakeet",
     };
     db::set_setting(conn, KEY_STT_ENGINE, engine_str)?;
+    let device_str = match settings.device {
+        DeviceSetting::Auto => "auto",
+        DeviceSetting::Cuda => "cuda",
+        DeviceSetting::Cpu => "cpu",
+    };
+    db::set_setting(conn, KEY_STT_DEVICE, device_str)?;
     Ok(())
+}
+
+/// Pure resolver (split from `resolve_device` so it's unit-testable without
+/// an async `nvidia-smi` probe): `Auto` requires *both* GPU hardware
+/// presence and the GPU pip extras actually being installed before picking
+/// `cuda`; an explicit `Cuda`/`Cpu` choice is always honored as-is (if the
+/// user forces `cuda` without the extras installed, the worker fails with a
+/// clear subprocess error rather than this function silently downgrading
+/// it -- see CLAUDE.md's "don't silently degrade" precedent in thermal.rs).
+fn resolve_device_from(pref: DeviceSetting, gpu_present: bool, gpu_packages_ready: bool) -> &'static str {
+    match pref {
+        DeviceSetting::Cpu => "cpu",
+        DeviceSetting::Cuda => "cuda",
+        DeviceSetting::Auto => {
+            if gpu_present && gpu_packages_ready {
+                "cuda"
+            } else {
+                "cpu"
+            }
+        }
+    }
+}
+
+pub(super) async fn resolve_device(pref: DeviceSetting) -> &'static str {
+    resolve_device_from(pref, crate::thermal::gpu_present().await, crate::setup::paths::gpu_packages_ready())
+}
+
+/// CTranslate2 has no float16 CPU kernel; `int8` is its recommended
+/// CPU-speed/accuracy tradeoff.
+pub(super) fn compute_type_for(device: &str) -> &'static str {
+    if device == "cuda" { "float16" } else { "int8" }
 }
 
 #[derive(Deserialize)]
@@ -99,17 +158,17 @@ pub(super) fn python_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("python")
 }
 
-fn whisper_command(wav_path: &Path, language_override: Option<&str>) -> Command {
-    let mut cmd = Command::new("python");
+fn whisper_command(wav_path: &Path, language_override: Option<&str>, device: &str) -> Command {
+    let mut cmd = Command::new(crate::setup::paths::python_program());
     cmd.arg(python_dir().join("whisper_worker.py"))
         .arg("--audio")
         .arg(wav_path)
         .arg("--model")
         .arg(DEFAULT_MODEL)
         .arg("--device")
-        .arg("cuda")
+        .arg(device)
         .arg("--compute-type")
-        .arg("float16");
+        .arg(compute_type_for(device));
     if let Some(lang) = language_override {
         cmd.arg("--language").arg(lang);
     }
@@ -124,13 +183,13 @@ fn whisper_command(wav_path: &Path, language_override: Option<&str>) -> Command 
 /// `python/parakeet_worker.py`'s doc comment — so `language_override` here is
 /// purely a label for the `language` field the worker echoes back, not a
 /// decoding constraint.
-fn parakeet_command(wav_path: &Path, language_override: Option<&str>) -> Command {
-    let mut cmd = Command::new("python");
+fn parakeet_command(wav_path: &Path, language_override: Option<&str>, device: &str) -> Command {
+    let mut cmd = Command::new(crate::setup::paths::python_program());
     cmd.arg(python_dir().join("parakeet_worker.py"))
         .arg("--audio")
         .arg(wav_path)
         .arg("--device")
-        .arg("cuda");
+        .arg(device);
     if let Some(lang) = language_override {
         cmd.arg("--language").arg(lang);
     }
@@ -202,11 +261,13 @@ pub async fn transcribe(
     wav_path: &Path,
     language_override: Option<&str>,
     engine: SttEngine,
+    device_pref: DeviceSetting,
     on_progress: impl Fn(f64) + Send + 'static,
 ) -> Result<TranscriptionResult> {
+    let device = resolve_device(device_pref).await;
     let mut cmd = match engine {
-        SttEngine::Whisper => whisper_command(wav_path, language_override),
-        SttEngine::Parakeet => parakeet_command(wav_path, language_override),
+        SttEngine::Whisper => whisper_command(wav_path, language_override, device),
+        SttEngine::Parakeet => parakeet_command(wav_path, language_override, device),
     };
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -214,7 +275,7 @@ pub async fn transcribe(
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
-            "failed to spawn {} worker (is `python` on PATH with its dependencies installed?)",
+            "failed to spawn {} worker (is the bundled Python runtime installed? see Settings \u{2192} Dependencies)",
             match engine {
                 SttEngine::Whisper => "whisper",
                 SttEngine::Parakeet => "parakeet",
@@ -279,7 +340,7 @@ mod tests {
             .join("sample_en.wav");
         assert!(fixture.exists(), "fixture missing at {fixture:?}");
 
-        let result = transcribe(&fixture, None, SttEngine::Whisper, |_| {})
+        let result = transcribe(&fixture, None, SttEngine::Whisper, DeviceSetting::Auto, |_| {})
             .await
             .expect("transcription should succeed");
 
@@ -304,7 +365,7 @@ mod tests {
         let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_clone = progress.clone();
 
-        transcribe(&fixture, None, SttEngine::Whisper, move |p| {
+        transcribe(&fixture, None, SttEngine::Whisper, DeviceSetting::Auto, move |p| {
             progress_clone.lock().unwrap().push(p);
         })
         .await
@@ -331,10 +392,30 @@ mod tests {
             .join("fixtures")
             .join("sample_en.wav");
 
-        let result = transcribe(&fixture, Some("en"), SttEngine::Whisper, |_| {})
+        let result = transcribe(&fixture, Some("en"), SttEngine::Whisper, DeviceSetting::Auto, |_| {})
             .await
             .expect("transcription should succeed");
 
         assert_eq!(result.language, "en");
+    }
+
+    #[test]
+    fn resolve_device_from_requires_both_gpu_and_packages_for_auto() {
+        assert_eq!(resolve_device_from(DeviceSetting::Auto, true, true), "cuda");
+        assert_eq!(resolve_device_from(DeviceSetting::Auto, true, false), "cpu");
+        assert_eq!(resolve_device_from(DeviceSetting::Auto, false, true), "cpu");
+        assert_eq!(resolve_device_from(DeviceSetting::Auto, false, false), "cpu");
+    }
+
+    #[test]
+    fn resolve_device_from_honors_explicit_choice_regardless_of_environment() {
+        assert_eq!(resolve_device_from(DeviceSetting::Cuda, false, false), "cuda");
+        assert_eq!(resolve_device_from(DeviceSetting::Cpu, true, true), "cpu");
+    }
+
+    #[test]
+    fn compute_type_matches_device() {
+        assert_eq!(compute_type_for("cuda"), "float16");
+        assert_eq!(compute_type_for("cpu"), "int8");
     }
 }

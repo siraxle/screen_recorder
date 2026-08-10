@@ -1,0 +1,17 @@
+# Installed only when setup::check_all() finds a real NVIDIA GPU (see
+# src-tauri/src/thermal.rs::gpu_present and
+# src-tauri/src/setup/python_runtime.rs). These are large (combined
+# ~1-2 GB) -- never install unconditionally.
+
+# ctranslate2's GPU wheel links against the CUDA 12 cuBLAS/cuDNN runtime.
+# These packages vendor that exact runtime as DLLs/shared libs, so a system
+# CUDA 12 install isn't required even on machines that only have a newer
+# CUDA toolkit installed. See whisper_worker.py's _register_cuda_dll_dirs
+# for how they're located at runtime.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# Re-installs onnx-asr with the `gpu` extra added (installs onnxruntime-gpu
+# so the CUDAExecutionProvider becomes available); safe to run after
+# requirements-common.txt already installed the `hub`-only variant.
+onnx-asr[gpu,hub]>=0.9

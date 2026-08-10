@@ -39,4 +39,9 @@ pub struct AppState {
     /// guards against a second click starting a competing HandBrakeCLI
     /// process against the same output file (see `commands::compress_recording`).
     pub compressing: Mutex<HashSet<String>>,
+    /// True while a `setup::install` call is in flight -- guards against a
+    /// second `install_dependencies` invocation racing the first one's
+    /// tmp-dir-then-rename install of the same component (see
+    /// `commands::install_dependencies`), same shape as `compressing`.
+    pub installing: Mutex<bool>,
 }

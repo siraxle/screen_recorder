@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use crate::capture::ffmpeg;
 use crate::db;
 
-use super::stt::{python_dir, DEFAULT_MODEL};
+use super::stt::{self, python_dir, DeviceSetting, DEFAULT_MODEL};
 
 const KEY_LIVE_SUBTITLES_ENABLED: &str = "live_subtitles_enabled";
 
@@ -122,16 +122,16 @@ impl WindowAccumulator {
     }
 }
 
-fn build_live_worker_command(language_override: Option<&str>) -> Command {
-    let mut cmd = Command::new("python");
+fn build_live_worker_command(language_override: Option<&str>, device: &str) -> Command {
+    let mut cmd = Command::new(crate::setup::paths::python_program());
     cmd.arg(python_dir().join("whisper_worker.py"))
         .arg("--live")
         .arg("--model")
         .arg(DEFAULT_MODEL)
         .arg("--device")
-        .arg("cuda")
+        .arg(device)
         .arg("--compute-type")
-        .arg("float16");
+        .arg(stt::compute_type_for(device));
     if let Some(lang) = language_override {
         cmd.arg("--language").arg(lang);
     }
@@ -163,7 +163,9 @@ impl LiveSubtitles {
     pub async fn start(
         app_handle: AppHandle,
         language_override: Option<String>,
+        device_pref: DeviceSetting,
     ) -> Result<(Self, mpsc::UnboundedSender<Vec<u8>>)> {
+        let device = stt::resolve_device(device_pref).await;
         let mut resampler = ffmpeg::build_resample_command()
             .kill_on_drop(true)
             .spawn()
@@ -174,9 +176,9 @@ impl LiveSubtitles {
             ffmpeg::spawn_stderr_drain(stderr, "live-subtitles-resample".to_string());
         }
 
-        let mut daemon = build_live_worker_command(language_override.as_deref())
+        let mut daemon = build_live_worker_command(language_override.as_deref(), device)
             .spawn()
-            .context("failed to spawn live whisper worker (is `python` on PATH?)")?;
+            .context("failed to spawn live whisper worker (is the bundled Python runtime installed? see Settings \u{2192} Dependencies)")?;
         let mut daemon_stdin = daemon.stdin.take().expect("daemon stdin was piped");
         let daemon_stdout = daemon.stdout.take().expect("daemon stdout was piped");
         if let Some(stderr) = daemon.stderr.take() {
@@ -390,7 +392,7 @@ mod tests {
             "fixture too short to produce even one window"
         );
 
-        let mut daemon = build_live_worker_command(Some("en"))
+        let mut daemon = build_live_worker_command(Some("en"), "cpu")
             .spawn()
             .expect("failed to spawn live whisper worker");
         let mut stdin = daemon.stdin.take().expect("daemon stdin was piped");

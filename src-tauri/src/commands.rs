@@ -51,7 +51,11 @@ pub async fn start_recording(
         .await
         .map_err(|e| e.to_string())?;
     let live_tap = if live_settings.enabled && settings.capture.capture_system_audio {
-        match LiveSubtitles::start(app.clone(), settings.language_override.clone()).await {
+        let stt_device = db::with_db(&state.db, |conn| stt::load_settings(conn))
+            .await
+            .map_err(|e| e.to_string())?
+            .device;
+        match LiveSubtitles::start(app.clone(), settings.language_override.clone(), stt_device).await {
             Ok((live, tap_tx)) => {
                 *state.live_subtitles.lock().await = Some(live);
                 Some(tap_tx)
@@ -840,6 +844,115 @@ pub async fn set_live_subtitle_settings(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Cheap, read-only dependency status (see `setup::check_all`) -- safe to
+/// call on every app-window mount and whenever the Settings "Dependencies"
+/// tab opens, not just once at startup.
+#[tauri::command]
+pub async fn check_dependencies(app: tauri::AppHandle) -> Result<crate::setup::DependencyReport, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(crate::setup::check_all(&dir).await)
+}
+
+/// Downloads and installs the given dependencies (see `setup::install`),
+/// only ever run after the frontend's explicit user confirmation. Awaited
+/// by the caller rather than fire-and-forget (unlike `compress_recording`)
+/// since there's no persisted job-queue entry for an install -- progress
+/// still streams live via `dependency-install-progress` while the caller's
+/// promise is pending, so the UI isn't stuck without feedback for the
+/// (potentially several-minute) duration.
+#[tauri::command]
+pub async fn install_dependencies(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    targets: Vec<crate::setup::DependencyId>,
+) -> Result<(), String> {
+    {
+        let mut installing = state.installing.lock().await;
+        if *installing {
+            return Err("an install is already in progress".to_string());
+        }
+        *installing = true;
+    }
+
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let progress_app = app.clone();
+    let result = crate::setup::install(&dir, &targets, move |progress| {
+        let _ = progress_app.emit("dependency-install-progress", &progress);
+    })
+    .await;
+
+    *state.installing.lock().await = false;
+    result.map_err(|e| e.to_string())?;
+
+    let report = crate::setup::check_all(&dir).await;
+    let _ = app.emit("dependencies-changed", &report);
+    Ok(())
+}
+
+/// Looks for a Python/FFmpeg already installed elsewhere on the machine
+/// (PATH plus a handful of common install locations -- see `setup::scan`).
+/// Read-only and fast (spawns a couple of `where`/`--version` calls), so it's
+/// safe to call every time the user clicks "Scan my PC," not just once.
+#[tauri::command]
+pub async fn scan_dependencies() -> Result<Vec<crate::setup::ScannedCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(crate::setup::scan::scan_all).await.map_err(|e| e.to_string())
+}
+
+/// Opens the native folder picker for the user to point at an existing
+/// Python or FFmpeg install. Returns `None` if cancelled; does not validate
+/// or adopt anything by itself -- the caller follows up with
+/// `use_dependency_path` once it has a path.
+#[tauri::command]
+pub async fn pick_dependency_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder().map(|p| p.to_string()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Validates `folder` actually contains a working copy of `id`, then adopts
+/// it as an override (persisted so it survives restarts) and returns the
+/// refreshed report. Used both for the "Scan my PC" accept action
+/// (`source: "system"`) and the manual "browse for folder" flow
+/// (`source: "custom"`).
+#[tauri::command]
+pub async fn use_dependency_path(
+    app: tauri::AppHandle,
+    id: crate::setup::DependencyId,
+    path: String,
+    source: crate::setup::DependencySource,
+) -> Result<crate::setup::DependencyReport, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let folder = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || crate::setup::apply_override(&app_data_dir, id, &folder, source))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let report = crate::setup::check_all(&dir).await;
+    let _ = app.emit("dependencies-changed", &report);
+    Ok(report)
+}
+
+/// Reverts `id` to the bundled `runtime/` install, discarding any
+/// system/custom override.
+#[tauri::command]
+pub async fn clear_dependency_override(
+    app: tauri::AppHandle,
+    id: crate::setup::DependencyId,
+) -> Result<crate::setup::DependencyReport, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || crate::setup::clear_override(&app_data_dir, id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let report = crate::setup::check_all(&dir).await;
+    let _ = app.emit("dependencies-changed", &report);
+    Ok(report)
 }
 
 #[tauri::command]

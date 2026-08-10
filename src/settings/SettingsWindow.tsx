@@ -5,15 +5,16 @@ import {
   DEFAULT_LLM_SETTINGS,
   type HotkeySettings,
   type LlmSettingsResponse,
-  type SttEngine,
   type SttSettings,
 } from "./types";
+import DependencyPanel from "../setup/DependencyPanel";
 import "../App.css";
 
-type Tab = "speech" | "hotkeys" | "llm";
+type Tab = "speech" | "dependencies" | "hotkeys" | "llm";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "speech", label: "Speech recognition" },
+  { id: "dependencies", label: "Dependencies" },
   { id: "hotkeys", label: "Hotkeys" },
   { id: "llm", label: "LLM provider" },
 ];
@@ -23,7 +24,7 @@ function SettingsWindow() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [sttSettings, setSttSettings] = useState<SttSettings>({ engine: "whisper" });
+  const [sttSettings, setSttSettings] = useState<SttSettings>({ engine: "whisper", device: "auto" });
   const [sttSettingsSaved, setSttSettingsSaved] = useState(false);
 
   const [hotkeySettings, setHotkeySettings] = useState<HotkeySettings>(DEFAULT_HOTKEY_SETTINGS);
@@ -70,13 +71,13 @@ function SettingsWindow() {
     }
   }
 
-  async function handleSaveSttSettings(engine: SttEngine) {
+  async function handleSaveSttSettings(next: SttSettings) {
     setSttSettingsSaved(false);
     setBusy(true);
     setError(null);
     try {
-      await invoke("set_stt_settings", { settings: { engine } });
-      setSttSettings({ engine });
+      await invoke("set_stt_settings", { settings: next });
+      setSttSettings(next);
       setSttSettingsSaved(true);
     } catch (e) {
       setError(String(e));
@@ -165,7 +166,7 @@ function SettingsWindow() {
               type="radio"
               name="stt-engine"
               checked={sttSettings.engine === "whisper"}
-              onChange={() => handleSaveSttSettings("whisper")}
+              onChange={() => handleSaveSttSettings({ ...sttSettings, engine: "whisper" })}
             />
             Whisper (faster-whisper) — 99+ languages, auto-detects the spoken language
           </label>
@@ -174,11 +175,47 @@ function SettingsWindow() {
               type="radio"
               name="stt-engine"
               checked={sttSettings.engine === "parakeet"}
-              onChange={() => handleSaveSttSettings("parakeet")}
+              onChange={() => handleSaveSttSettings({ ...sttSettings, engine: "parakeet" })}
             />
             NVIDIA Parakeet-TDT-0.6B-v3 — ~25 languages, much faster, no language auto-detect
           </label>
+
+          <h2>Compute device</h2>
+          <label className="checkbox-row">
+            <input
+              type="radio"
+              name="stt-device"
+              checked={sttSettings.device === "auto"}
+              onChange={() => handleSaveSttSettings({ ...sttSettings, device: "auto" })}
+            />
+            Auto — use the GPU when an NVIDIA card and its packages are installed, CPU otherwise
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="radio"
+              name="stt-device"
+              checked={sttSettings.device === "cuda"}
+              onChange={() => handleSaveSttSettings({ ...sttSettings, device: "cuda" })}
+            />
+            Force GPU (NVIDIA) — requires the GPU packages installed on the Dependencies tab
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="radio"
+              name="stt-device"
+              checked={sttSettings.device === "cpu"}
+              onChange={() => handleSaveSttSettings({ ...sttSettings, device: "cpu" })}
+            />
+            Force CPU
+          </label>
           {sttSettingsSaved && <span className="output"> Saved.</span>}
+        </section>
+      )}
+
+      {tab === "dependencies" && (
+        <section className="panel">
+          <h2>Dependencies</h2>
+          <DependencyPanel />
         </section>
       )}
 
