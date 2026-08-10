@@ -5,7 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 
-use super::config::CaptureConfig;
+use super::config::{CaptureConfig, WebcamCorner, WebcamOverlayConfig, WebcamShape};
 use super::system_audio;
 
 /// Reads a child's stderr to completion in the background and logs it via
@@ -66,10 +66,36 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
         .arg("-i")
         .arg("desktop");
 
-    if config.capture_microphone {
+    // Track input indices as optional inputs are added below (desktop is
+    // always input 0), so the F16 webcam-overlay filter graph and the
+    // (explicit, once -filter_complex is in play) audio -map can reference
+    // the right stream regardless of which combination of mic/webcam is
+    // enabled this session.
+    let mut next_input_index: usize = 1;
+
+    let webcam_index = if config.webcam.enabled {
         // dshow has no "use OS default" device name; callers must resolve a
         // concrete device (see `CaptureController::begin_segment`) before
-        // this is invoked.
+        // this is invoked, same as the microphone below.
+        let device = config
+            .webcam
+            .device
+            .as_deref()
+            .expect("webcam.enabled requires a resolved webcam.device");
+        cmd.arg("-f")
+            .arg("dshow")
+            .arg("-framerate")
+            .arg(config.framerate.to_string())
+            .arg("-i")
+            .arg(format!("video={device}"));
+        let idx = next_input_index;
+        next_input_index += 1;
+        Some(idx)
+    } else {
+        None
+    };
+
+    let mic_index = if config.capture_microphone {
         let mic = config
             .microphone_device
             .as_deref()
@@ -78,6 +104,22 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
             .arg("dshow")
             .arg("-i")
             .arg(format!("audio={mic}"));
+        Some(next_input_index)
+    } else {
+        None
+    };
+
+    // Without the webcam overlay, stream mapping stays fully implicit
+    // (ffmpeg's default "one stream per type" selection), exactly matching
+    // this command's shape before F16 -- so a recording with the overlay
+    // disabled is byte-for-byte unaffected by this feature's existence.
+    if let Some(cam_idx) = webcam_index {
+        cmd.arg("-filter_complex")
+            .arg(build_webcam_overlay_filter(cam_idx, &config.webcam));
+        cmd.arg("-map").arg("[outv]");
+        if let Some(mic_idx) = mic_index {
+            cmd.arg("-map").arg(format!("{mic_idx}:a"));
+        }
     }
 
     cmd.arg("-c:v")
@@ -98,6 +140,46 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     cmd
+}
+
+/// Builds the F16 webcam-overlay filter graph: crops the webcam feed to a
+/// square, scales it to a fixed fraction of the desktop capture's own width
+/// (via `scale2ref`, so this never needs to query the desktop's actual
+/// resolution), optionally masks it into a circle, then overlays it onto the
+/// desktop video in the configured corner with a fixed margin.
+#[cfg(target_os = "windows")]
+fn build_webcam_overlay_filter(cam_index: usize, webcam: &WebcamOverlayConfig) -> String {
+    // Fixed rather than user-configurable -- the user asked for corner and
+    // shape to be pickable, not a size slider; both can become settings
+    // later if wanted. 0.45 = 2.5x the original 0.18 default.
+    const SIZE_FRACTION: &str = "0.45";
+    const MARGIN_PX: i32 = 24;
+
+    let mask = match webcam.shape {
+        // Hard-edge circular alpha mask (no feathering) -- simple and cheap
+        // enough on an already-small (scaled-down) frame.
+        WebcamShape::Circle => {
+            "[camscaled]format=yuva420p,geq=lum='p(X,Y)':a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)'[camfinal]"
+                .to_string()
+        }
+        WebcamShape::Square => "[camscaled]copy[camfinal]".to_string(),
+    };
+
+    let (x, y) = match webcam.corner {
+        WebcamCorner::TopLeft => (format!("{MARGIN_PX}"), format!("{MARGIN_PX}")),
+        WebcamCorner::TopRight => (format!("main_w-w-{MARGIN_PX}"), format!("{MARGIN_PX}")),
+        WebcamCorner::BottomLeft => (format!("{MARGIN_PX}"), format!("main_h-h-{MARGIN_PX}")),
+        WebcamCorner::BottomRight => {
+            (format!("main_w-w-{MARGIN_PX}"), format!("main_h-h-{MARGIN_PX}"))
+        }
+    };
+
+    format!(
+        "[{cam_index}:v]crop='min(iw,ih)':'min(iw,ih)'[camsq];\
+         [camsq][0:v]scale2ref=w=main_w*{SIZE_FRACTION}:h=main_w*{SIZE_FRACTION}[camscaled][mainref];\
+         {mask};\
+         [mainref][camfinal]overlay={x}:{y}[outv]"
+    )
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -310,5 +392,39 @@ pub async fn list_microphones() -> Result<Vec<String>> {
 
 #[cfg(not(target_os = "windows"))]
 pub async fn list_microphones() -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+/// Enumerates dshow video input device names (webcams), for F16's camera
+/// picker. Mirrors `list_microphones` exactly, filtering on `"(video)"`
+/// instead of `"(audio)"` in the same `-list_devices` stderr output.
+#[cfg(target_os = "windows")]
+pub async fn list_cameras() -> Result<Vec<String>> {
+    let output = Command::new(crate::setup::paths::ffmpeg_program())
+        .args(["-hide_banner", "-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to run ffmpeg -list_devices")?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut devices = Vec::new();
+    for line in stderr.lines() {
+        if !line.contains("(video)") {
+            continue;
+        }
+        if let Some(start) = line.find('"') {
+            if let Some(len) = line[start + 1..].find('"') {
+                devices.push(line[start + 1..start + 1 + len].to_string());
+            }
+        }
+    }
+    Ok(devices)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn list_cameras() -> Result<Vec<String>> {
     Ok(Vec::new())
 }

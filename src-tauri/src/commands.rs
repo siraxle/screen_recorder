@@ -21,6 +21,12 @@ pub async fn list_microphones() -> Result<Vec<String>, String> {
     ffmpeg::list_microphones().await.map_err(|e| e.to_string())
 }
 
+/// F16 webcam overlay's camera picker, mirroring `list_microphones`.
+#[tauri::command]
+pub async fn list_cameras() -> Result<Vec<String>, String> {
+    ffmpeg::list_cameras().await.map_err(|e| e.to_string())
+}
+
 /// `start_recording`'s input: capture source selection plus the
 /// transcription-language setting for this recording (F2's "user manually
 /// specifies the language in settings before transcription" criterion).

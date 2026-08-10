@@ -154,6 +154,7 @@ Translation is a separate job-queue task (`translating`), run after `transcribed
 - Choice of Whisper model size and local LLM, with an indication of expected speed/quality for the current hardware.
 - Hotkeys for start/stop/pause.
 - Private screen zones (masking a region, e.g., a password manager) — cut out of the video and not passed to STT/LLM.
+- Webcam picture-in-picture overlay: composite the front camera into a chosen corner of the recording, as a small circle or square.
 
 ### Nice-to-have (v2)
 - Automatic local/cloud LLM routing based on task complexity.
@@ -309,6 +310,19 @@ Core principle: **Capture → Transcribe → Summarize → Index** — an asynch
 - Given the user marked a screen region as a "private zone" before starting the recording
   When recording is in progress
   Then that region is hidden (blurred/blacked out) in the saved video and is not passed to STT/LLM.
+
+**F16. Webcam overlay**
+- Given the user enabled "Webcam overlay" and selected a camera, shape (circle/square), and corner before starting the recording
+  When they click "Start Recording"
+  Then the saved video shows the camera feed composited into the chosen corner, in the chosen shape, for the whole recording.
+
+- Given "Webcam overlay" is not enabled
+  When a recording is made
+  Then the saved video is unaffected — screen (and audio) capture only, exactly as before this feature existed.
+
+- Given "Webcam overlay" is enabled but no camera is available on the machine
+  When the user clicks "Start Recording"
+  Then the app shows a clear error and does not start recording, matching how a missing microphone is handled.
 
 ### Milestone 3 — v2 (weeks 10–15)
 

@@ -156,6 +156,18 @@ impl CaptureController {
             })?);
         }
 
+        // Same auto-resolve as the microphone above, for F16's webcam
+        // overlay: an unset `webcam.device` picks the first camera ffmpeg
+        // enumerates.
+        if self.config.webcam.enabled && self.config.webcam.device.is_none() {
+            let cameras = ffmpeg::list_cameras()
+                .await
+                .context("failed to enumerate cameras")?;
+            self.config.webcam.device = Some(cameras.into_iter().next().ok_or_else(|| {
+                anyhow!("webcam overlay is enabled but no camera device was found")
+            })?);
+        }
+
         let mut cmd = ffmpeg::build_segment_command(&self.config, &video_path);
         let mut video_child = cmd
             .spawn()
@@ -232,6 +244,7 @@ impl CaptureController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::config::WebcamOverlayConfig;
     use std::time::Duration;
 
     /// Exercises the real pipeline end-to-end (spawns actual ffmpeg + a real
@@ -250,6 +263,7 @@ mod tests {
             capture_microphone: false,
             microphone_device: None,
             framerate: 10,
+            webcam: WebcamOverlayConfig::default(),
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
@@ -272,6 +286,50 @@ mod tests {
             .expect("stop should succeed and produce a file");
 
         assert_eq!(controller.status(), RecordingStatus::Stopped);
+        assert!(result.exists(), "output file must exist");
+        let size = std::fs::metadata(&result).unwrap().len();
+        assert!(size > 1000, "output file is suspiciously small: {size} bytes");
+    }
+
+    /// F16: exercises the real webcam-overlay filter graph against an
+    /// actual camera, rather than mocking ffmpeg -- but skips (not fails)
+    /// when this machine has no camera attached, since dev/CI hardware
+    /// varies (mirrors how the test above avoids depending on a specific
+    /// mic device).
+    #[tokio::test]
+    async fn records_with_webcam_overlay_when_camera_present() {
+        let cameras = ffmpeg::list_cameras().await.expect("list_cameras should not error");
+        let Some(device) = cameras.into_iter().next() else {
+            eprintln!("skipping records_with_webcam_overlay_when_camera_present: no camera found");
+            return;
+        };
+
+        let base_dir = std::env::temp_dir().join("screen_recorder_webcam_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let config = CaptureConfig {
+            capture_system_audio: false,
+            capture_microphone: false,
+            microphone_device: None,
+            framerate: 10,
+            webcam: WebcamOverlayConfig {
+                enabled: true,
+                device: Some(device),
+                ..WebcamOverlayConfig::default()
+            },
+        };
+        let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
+
+        controller.start().await.expect("start should succeed");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let output_path = base_dir.join("output.mp4");
+        let result = controller
+            .stop(&output_path)
+            .await
+            .expect("stop should succeed and produce a file");
+
         assert!(result.exists(), "output file must exist");
         let size = std::fs::metadata(&result).unwrap().len();
         assert!(size > 1000, "output file is suspiciously small: {size} bytes");

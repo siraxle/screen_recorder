@@ -119,6 +119,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_microphones,
+            commands::list_cameras,
             commands::start_recording,
             commands::pause_recording,
             commands::resume_recording,

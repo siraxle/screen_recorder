@@ -28,12 +28,30 @@ interface Summary {
   language: string;
 }
 
+type WebcamShape = "circle" | "square";
+type WebcamCorner = "top_left" | "top_right" | "bottom_left" | "bottom_right";
+
+interface WebcamOverlayConfig {
+  enabled: boolean;
+  device: string | null;
+  shape: WebcamShape;
+  corner: WebcamCorner;
+}
+
 interface CaptureConfig {
   captureSystemAudio: boolean;
   captureMicrophone: boolean;
   microphoneDevice: string | null;
   framerate: number;
+  webcam: WebcamOverlayConfig;
 }
+
+const WEBCAM_CORNER_OPTIONS: Array<{ value: WebcamCorner; label: string }> = [
+  { value: "top_left", label: "Top left" },
+  { value: "top_right", label: "Top right" },
+  { value: "bottom_left", label: "Bottom left" },
+  { value: "bottom_right", label: "Bottom right" },
+];
 
 interface RecordingSummary {
   id: string;
@@ -274,6 +292,11 @@ function App() {
   const [captureSystemAudio, setCaptureSystemAudio] = useState(true);
   const [captureMicrophone, setCaptureMicrophone] = useState(true);
   const [microphoneDevice, setMicrophoneDevice] = useState<string>("");
+  const [cameras, setCameras] = useState<string[]>([]);
+  const [webcamEnabled, setWebcamEnabled] = useState(false);
+  const [webcamDevice, setWebcamDevice] = useState<string>("");
+  const [webcamShape, setWebcamShape] = useState<WebcamShape>("circle");
+  const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("bottom_right");
   const [languageOverride, setLanguageOverride] = useState<string>("");
   const [customLanguage, setCustomLanguage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
@@ -322,6 +345,15 @@ function App() {
       .then((devices) => {
         setMicrophones(devices);
         if (devices.length > 0) setMicrophoneDevice(devices[0]);
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    invoke<string[]>("list_cameras")
+      .then((devices) => {
+        setCameras(devices);
+        if (devices.length > 0) setWebcamDevice(devices[0]);
       })
       .catch((e) => setError(String(e)));
   }, []);
@@ -724,6 +756,12 @@ function App() {
       captureMicrophone,
       microphoneDevice: captureMicrophone && microphoneDevice ? microphoneDevice : null,
       framerate: 30,
+      webcam: {
+        enabled: webcamEnabled,
+        device: webcamEnabled && webcamDevice ? webcamDevice : null,
+        shape: webcamShape,
+        corner: webcamCorner,
+      },
     };
     await run(() =>
       invoke("start_recording", {
@@ -1141,6 +1179,57 @@ function App() {
           />
           System audio (WASAPI loopback)
         </label>
+
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={webcamEnabled}
+            disabled={status !== "stopped"}
+            onChange={(e) => setWebcamEnabled(e.currentTarget.checked)}
+          />
+          Webcam overlay
+        </label>
+        {webcamEnabled && (
+          <>
+            <select
+              value={webcamDevice}
+              disabled={status !== "stopped"}
+              onChange={(e) => setWebcamDevice(e.currentTarget.value)}
+            >
+              {cameras.length === 0 && <option value="">No camera found</option>}
+              {cameras.map((device) => (
+                <option key={device} value={device}>
+                  {device}
+                </option>
+              ))}
+            </select>
+            <label className="checkbox-row">
+              Shape
+              <select
+                value={webcamShape}
+                disabled={status !== "stopped"}
+                onChange={(e) => setWebcamShape(e.currentTarget.value as WebcamShape)}
+              >
+                <option value="circle">Circle</option>
+                <option value="square">Square</option>
+              </select>
+            </label>
+            <label className="checkbox-row">
+              Corner
+              <select
+                value={webcamCorner}
+                disabled={status !== "stopped"}
+                onChange={(e) => setWebcamCorner(e.currentTarget.value as WebcamCorner)}
+              >
+                {WEBCAM_CORNER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </>
+        )}
 
         <label className="checkbox-row">
           <input
