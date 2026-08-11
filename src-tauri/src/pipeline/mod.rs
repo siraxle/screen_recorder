@@ -263,6 +263,7 @@ async fn process_job(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> R
         }
         Err(e) => {
             let message = format!("{e:#}");
+            tracing::error!("job {} ({}) failed for recording {recording_id}: {message}", job.id, job.stage);
             let job_id = job.id.clone();
             let stored_message = message.clone();
             db::with_db(db, move |conn| db::set_job_failed(conn, &job_id, &stored_message)).await?;
@@ -529,6 +530,7 @@ async fn process_translate_job(
         }
         Err(e) => {
             let message = format!("{e:#}");
+            tracing::error!("job {} (translate) failed for recording {recording_id}: {message}", job.id);
             let job_id = job.id.clone();
             let stored_message = message.clone();
             db::with_db(db, move |conn| db::set_job_failed(conn, &job_id, &stored_message)).await?;
