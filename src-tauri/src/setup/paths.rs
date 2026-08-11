@@ -24,6 +24,40 @@ pub fn venv_python_exe(app_data_dir: &Path) -> PathBuf {
     python_venv_dir(app_data_dir).join("Scripts").join("python.exe")
 }
 
+/// Directory containing the bundled Python worker scripts
+/// (`whisper_worker.py`, `parakeet_worker.py`) and pip requirements files
+/// (`requirements-common.txt`, `requirements-gpu.txt`). Not to be confused
+/// with `python_dir` above, which is the *installed runtime* (interpreter +
+/// venv) under `<app_data_dir>/runtime/python` -- this is the read-only
+/// source material that gets pip-installed into that runtime.
+///
+/// Resolved relative to the running exe's own location, never via
+/// `CARGO_MANIFEST_DIR` (a compile-time constant baked into the binary that
+/// names wherever it happened to be *built*, not wherever it's *running*).
+/// Using that constant at runtime used to work by accident in dev
+/// (`cargo tauri dev`/`cargo test` never leave the dev machine) but broke
+/// every distributed build: an installed or portable copy shipped to a
+/// different PC still carried the original dev machine's absolute path
+/// baked in, so pip's `-r <path>` pointed at a directory that doesn't
+/// exist there and failed immediately. See `bundle.resources` in
+/// `tauri.conf.json` (installed build) and `scripts/build-portable.ps1`
+/// (portable build), both of which place a copy of `python/` at
+/// `<exe_dir>/python`.
+pub fn bundled_python_scripts_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let bundled = exe_dir.join("python");
+            if bundled.join("whisper_worker.py").is_file() {
+                return bundled;
+            }
+        }
+    }
+    // Dev fallback: no bundled copy sits next to a `cargo build`/`cargo
+    // test` profile exe, so read straight from the source tree.
+    // CARGO_MANIFEST_DIR is `<repo>/src-tauri` at compile time.
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("python")
+}
+
 pub fn ffmpeg_dir(app_data_dir: &Path) -> PathBuf {
     runtime_dir(app_data_dir).join("ffmpeg")
 }

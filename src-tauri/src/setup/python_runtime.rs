@@ -11,11 +11,11 @@ use tokio::process::Command;
 
 use super::{archive, download, paths, versions, StageProgressFn};
 
-/// `<repo>/python`, resolved the same way `pipeline::stt::python_dir` does
-/// (via `CARGO_MANIFEST_DIR`, which is `<repo>/src-tauri` at compile time) --
-/// this is where `requirements-common.txt`/`requirements-gpu.txt` live.
+/// Where `requirements-common.txt`/`requirements-gpu.txt` live -- shared
+/// with `pipeline::stt::python_dir` via `paths::bundled_python_scripts_dir`
+/// (see its doc comment for why this can't just be `CARGO_MANIFEST_DIR`).
 fn repo_python_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("python")
+    paths::bundled_python_scripts_dir()
 }
 
 /// Extracts the pinned interpreter, creates a venv, and installs

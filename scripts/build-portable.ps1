@@ -82,10 +82,32 @@ Write-Host "==> Copying exe"
 Copy-Item $ExePath (Join-Path $PortableRoot "ScreenRecorder.exe")
 
 Write-Host "==> Copying bundled resources (HandBrakeCLI)"
-$ResourcesDest = Join-Path $PortableRoot "resources"
-New-Item -ItemType Directory -Force $ResourcesDest | Out-Null
-Copy-Item (Join-Path $SrcTauri "resources\HandBrakeCLI.exe") $ResourcesDest
-Copy-Item (Join-Path $SrcTauri "resources\HandBrakeCLI-LICENSE.txt") $ResourcesDest
+# Flat, directly beside the exe -- NOT under a `resources\` subfolder.
+# `compress::handbrake_cli_path` looks it up via Tauri's `resource_dir()`,
+# which on Windows always resolves to the exe's own directory (see
+# `tauri-utils::platform::resource_dir_from`), matching how
+# `bundle.resources` in tauri.conf.json maps it to the flat target
+# "HandBrakeCLI.exe" for the installed build. Nesting it here would make
+# "Compress for web" silently fail to find HandBrakeCLI.exe in the portable
+# build.
+Copy-Item (Join-Path $SrcTauri "resources\HandBrakeCLI.exe") $PortableRoot
+Copy-Item (Join-Path $SrcTauri "resources\HandBrakeCLI-LICENSE.txt") $PortableRoot
+
+# Worker scripts + pip requirements files, mirroring the "../python/..." ->
+# "python/..." mapping in tauri.conf.json's bundle.resources so the
+# installed and portable builds resolve them the same way at runtime (see
+# `setup::paths::bundled_python_scripts_dir`) -- NOT bundling the interpreter
+# itself, which stays an on-demand download (see the note at the bottom of
+# this script). Without this, `paths::bundled_python_scripts_dir()`'s
+# CARGO_MANIFEST_DIR dev-fallback kicks in, which bakes in this build
+# machine's absolute source path and breaks pip install on any other PC.
+Write-Host "==> Copying bundled resources (Python worker scripts)"
+$PythonDest = Join-Path $PortableRoot "python"
+New-Item -ItemType Directory -Force $PythonDest | Out-Null
+Copy-Item (Join-Path $RepoRoot "python\whisper_worker.py") $PythonDest
+Copy-Item (Join-Path $RepoRoot "python\parakeet_worker.py") $PythonDest
+Copy-Item (Join-Path $RepoRoot "python\requirements-common.txt") $PythonDest
+Copy-Item (Join-Path $RepoRoot "python\requirements-gpu.txt") $PythonDest
 
 Write-Host "==> Downloading + verifying pinned FFmpeg build"
 $FfmpegBinDest = Join-Path $PortableRoot "data\runtime\ffmpeg\bin"

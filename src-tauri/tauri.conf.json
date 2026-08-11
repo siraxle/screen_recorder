@@ -34,7 +34,11 @@
     ],
     "resources": {
       "resources/HandBrakeCLI.exe": "HandBrakeCLI.exe",
-      "resources/HandBrakeCLI-LICENSE.txt": "HandBrakeCLI-LICENSE.txt"
+      "resources/HandBrakeCLI-LICENSE.txt": "HandBrakeCLI-LICENSE.txt",
+      "../python/whisper_worker.py": "python/whisper_worker.py",
+      "../python/parakeet_worker.py": "python/parakeet_worker.py",
+      "../python/requirements-common.txt": "python/requirements-common.txt",
+      "../python/requirements-gpu.txt": "python/requirements-gpu.txt"
     }
   }
 }

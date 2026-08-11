@@ -152,10 +152,7 @@ pub struct TranscriptionResult {
 }
 
 pub(super) fn python_dir() -> PathBuf {
-    // CARGO_MANIFEST_DIR is `<repo>/src-tauri` at compile time, so this
-    // resolves correctly regardless of the process's working directory
-    // (`cargo tauri dev` vs. a packaged app).
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("python")
+    crate::setup::paths::bundled_python_scripts_dir()
 }
 
 fn whisper_command(wav_path: &Path, language_override: Option<&str>, device: &str) -> Command {
