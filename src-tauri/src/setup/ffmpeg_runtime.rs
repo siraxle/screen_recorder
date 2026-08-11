@@ -10,6 +10,7 @@ use super::{archive, download, paths, versions, StageProgressFn};
 /// renamed into `runtime/ffmpeg/` only once `ffmpeg.exe`/`ffprobe.exe` are
 /// confirmed present.
 pub async fn install(app_data_dir: &Path, on_progress: StageProgressFn) -> Result<()> {
+    tracing::info!("installing FFmpeg");
     let runtime_dir = paths::runtime_dir(app_data_dir);
     tokio::fs::create_dir_all(&runtime_dir).await?;
     // The zip and its extracted contents briefly coexist inside the tmp
@@ -19,7 +20,8 @@ pub async fn install(app_data_dir: &Path, on_progress: StageProgressFn) -> Resul
 
     let tmp = paths::tmp_component_dir(app_data_dir, "ffmpeg");
     let result = try_install_into(&tmp, &on_progress).await;
-    if result.is_err() {
+    if let Err(e) = &result {
+        tracing::error!("FFmpeg install failed: {e:#}");
         let _ = std::fs::remove_dir_all(&tmp);
         return result;
     }
@@ -32,6 +34,7 @@ pub async fn install(app_data_dir: &Path, on_progress: StageProgressFn) -> Resul
         .await
         .with_context(|| format!("failed to move {tmp:?} into place at {final_dir:?}"))?;
     on_progress("done", 1.0);
+    tracing::info!("FFmpeg installed");
     Ok(())
 }
 

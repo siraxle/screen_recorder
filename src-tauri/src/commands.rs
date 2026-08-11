@@ -9,6 +9,7 @@ use crate::compress;
 use crate::db::{self, RecordingSummary, Segment, Summary};
 use crate::hotkeys::{self, HotkeySettings};
 use crate::llm::{self, LlmSettings, ProviderKind};
+use crate::logging::{self, log_err};
 use crate::overlay;
 use crate::pipeline::live_subtitles::{self, LiveSubtitles, LiveSubtitlesSettings};
 use crate::pipeline::stt::{self, SttSettings};
@@ -18,13 +19,13 @@ use crate::subtitle;
 
 #[tauri::command]
 pub async fn list_microphones() -> Result<Vec<String>, String> {
-    ffmpeg::list_microphones().await.map_err(|e| e.to_string())
+    ffmpeg::list_microphones().await.map_err(log_err)
 }
 
 /// F16 webcam overlay's camera picker, mirroring `list_microphones`.
 #[tauri::command]
 pub async fn list_cameras() -> Result<Vec<String>, String> {
-    ffmpeg::list_cameras().await.map_err(|e| e.to_string())
+    ffmpeg::list_cameras().await.map_err(log_err)
 }
 
 /// `start_recording`'s input: capture source selection plus the
@@ -55,11 +56,11 @@ pub async fn start_recording(
     // blocks the recording itself if either isn't the case.
     let live_settings = db::with_db(&state.db, |conn| live_subtitles::load_settings(conn))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     let live_tap = if live_settings.enabled && settings.capture.capture_system_audio {
         let stt_device = db::with_db(&state.db, |conn| stt::load_settings(conn))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
             .device;
         match LiveSubtitles::start(app.clone(), settings.language_override.clone(), stt_device).await {
             Ok((live, tap_tx)) => {
@@ -82,9 +83,10 @@ pub async fn start_recording(
         settings.language_override,
         live_tap,
     )
-    .map_err(|e| e.to_string())?;
-    controller.start().await.map_err(|e| e.to_string())?;
+    .map_err(log_err)?;
+    controller.start().await.map_err(log_err)?;
     *guard = Some(controller);
+    tracing::info!("recording started");
     Ok(())
 }
 
@@ -92,14 +94,18 @@ pub async fn start_recording(
 pub async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.controller.lock().await;
     let controller = guard.as_mut().ok_or("no recording in progress")?;
-    controller.pause().await.map_err(|e| e.to_string())
+    controller.pause().await.map_err(log_err)?;
+    tracing::info!("recording paused");
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn resume_recording(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.controller.lock().await;
     let controller = guard.as_mut().ok_or("no recording in progress")?;
-    controller.resume().await.map_err(|e| e.to_string())
+    controller.resume().await.map_err(log_err)?;
+    tracing::info!("recording resumed");
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -125,13 +131,13 @@ pub async fn stop_recording(
         chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
     );
     let recording_folder = recordings_dir.join(folder_name);
-    std::fs::create_dir_all(&recording_folder).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&recording_folder).map_err(log_err)?;
     let output_path = recording_folder.join("recording.mp4");
     let language_override = controller.language_override().map(str::to_string);
     let result_path = controller
         .stop(&output_path)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     // Dropping the controller here (rather than at function end) drops its
     // clone of the live-subtitles tap sender, which is what lets that
     // pipeline's EOF-driven shutdown in `LiveSubtitles::stop` begin
@@ -158,9 +164,10 @@ pub async fn stop_recording(
             )
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(log_err)?
     };
     let _ = state.job_tx.send(job_id);
+    tracing::info!("recording stopped, recording_id={recording_id}");
 
     Ok(StopRecordingResult {
         recording_id,
@@ -185,7 +192,7 @@ pub async fn pick_import_file(app: tauri::AppHandle) -> Result<Option<String>, S
             .map(|p| p.to_string())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(log_err)
 }
 
 /// Imports an already-existing video/audio file (F2 applied to a file the
@@ -211,7 +218,7 @@ pub async fn import_recording(
         chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
     );
     let recording_folder = recordings_dir.join(folder_name);
-    std::fs::create_dir_all(&recording_folder).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&recording_folder).map_err(log_err)?;
 
     let extension = source_path
         .extension()
@@ -220,7 +227,7 @@ pub async fn import_recording(
     let dest_path = recording_folder.join(format!("source.{extension}"));
     tokio::fs::copy(&source_path, &dest_path)
         .await
-        .map_err(|e| format!("failed to copy \"{path}\": {e}"))?;
+        .map_err(|e| log_err(format!("failed to copy \"{path}\": {e}")))?;
 
     let title = source_path
         .file_stem()
@@ -247,9 +254,10 @@ pub async fn import_recording(
             Ok(job_id)
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(log_err)?
     };
     let _ = state.job_tx.send(job_id);
+    tracing::info!("recording imported from \"{path}\", recording_id={recording_id}");
 
     Ok(StopRecordingResult {
         recording_id,
@@ -278,7 +286,7 @@ pub async fn pick_recordings_dir(app: tauri::AppHandle) -> Result<Option<String>
             .map(|p| p.to_string())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(log_err)
 }
 
 /// Changes where future recordings are saved. Rejected while a recording is
@@ -293,11 +301,12 @@ pub async fn set_recordings_dir(state: State<'_, AppState>, path: String) -> Res
     drop(guard);
 
     let new_dir = PathBuf::from(&path);
-    std::fs::create_dir_all(&new_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&new_dir).map_err(log_err)?;
 
+    tracing::info!("recordings folder changed to \"{path}\"");
     db::with_db(&state.db, move |conn| db::set_setting(conn, "recordings_dir", &path))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
 
     *state.recordings_dir.lock().await = new_dir;
     Ok(())
@@ -314,12 +323,12 @@ pub async fn recording_status(state: State<'_, AppState>) -> Result<RecordingSta
 /// independently of whether a recording is active.
 #[tauri::command]
 pub async fn show_annotation_overlay(app: tauri::AppHandle) -> Result<(), String> {
-    overlay::show(&app).map_err(|e| e.to_string())
+    overlay::show(&app).map_err(log_err)
 }
 
 #[tauri::command]
 pub async fn hide_annotation_overlay(app: tauri::AppHandle) -> Result<(), String> {
-    overlay::hide(&app).map_err(|e| e.to_string())
+    overlay::hide(&app).map_err(log_err)
 }
 
 /// The user-configurable OS-wide hotkey that opens/closes the annotation
@@ -329,7 +338,7 @@ pub async fn hide_annotation_overlay(app: tauri::AppHandle) -> Result<(), String
 pub async fn get_hotkey_settings(state: State<'_, AppState>) -> Result<HotkeySettings, String> {
     db::with_db(&state.db, |conn| hotkeys::load_settings(conn))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 #[tauri::command]
@@ -340,17 +349,19 @@ pub async fn set_hotkey_settings(
 ) -> Result<(), String> {
     hotkeys::apply(&app, &state, &settings.toggle_annotation)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     db::with_db(&state.db, move |conn| hotkeys::save_settings(conn, &settings))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)?;
+    tracing::info!("hotkey settings saved");
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<RecordingSummary>, String> {
     db::with_db(&state.db, db::list_recordings)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 /// Empty/whitespace-only titles are normalized to `None` so clearing the
@@ -370,7 +381,9 @@ pub async fn rename_recording(
         db::set_recording_title(conn, &recording_id, title.as_deref())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(log_err)?;
+    tracing::info!("recording renamed");
+    Ok(())
 }
 
 #[tauri::command]
@@ -380,13 +393,14 @@ pub async fn delete_recording(
 ) -> Result<(), String> {
     let video_path = db::with_db(&state.db, move |conn| db::delete_recording(conn, &recording_id))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     // Best-effort: the DB rows are already gone (the source of truth for
     // "is this recording deleted"), so a missing/locked folder here isn't
     // reported back as a failure.
     if let Some(folder) = video_path.parent() {
         let _ = std::fs::remove_dir_all(folder);
     }
+    tracing::info!("recording deleted");
     Ok(())
 }
 
@@ -397,7 +411,7 @@ pub async fn search_recordings(
 ) -> Result<Vec<db::SearchResult>, String> {
     db::with_db(&state.db, move |conn| db::search_recordings(conn, &query))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 #[tauri::command]
@@ -409,7 +423,7 @@ pub async fn get_transcript(
         db::get_transcript_segments(conn, &recording_id)
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(log_err)
 }
 
 /// `export_subtitles`'s response. A `Vec` rather than a single path because
@@ -443,9 +457,9 @@ fn write_subtitle_file(video_path: &std::path::Path, file_name: &str, contents: 
         .map(|dir| dir.join(file_name))
         .unwrap_or_else(|| PathBuf::from(file_name));
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(dir).map_err(log_err)?;
     }
-    std::fs::write(&path, contents).map_err(|e| e.to_string())?;
+    std::fs::write(&path, contents).map_err(log_err)?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -472,12 +486,13 @@ pub async fn export_subtitles(
     if mode != "original" && mode != "translated" && mode != "dual" {
         return Err(format!("unsupported export mode: {mode}"));
     }
+    tracing::info!("subtitle export requested: recording={recording_id} mode={mode} format={format}");
 
     let video_path = {
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::get_recording_video_path(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
 
     if mode == "original" {
@@ -485,13 +500,13 @@ pub async fn export_subtitles(
             db::get_transcript_segments(conn, &recording_id)
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
         let contents = render_subtitles(&format, &segments);
         let output_path = video_path.with_extension(&format);
         if let Some(dir) = output_path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(dir).map_err(log_err)?;
         }
-        std::fs::write(&output_path, contents).map_err(|e| e.to_string())?;
+        std::fs::write(&output_path, contents).map_err(log_err)?;
         return Ok(ExportSubtitlesResult { paths: vec![output_path.to_string_lossy().to_string()] });
     }
 
@@ -503,7 +518,7 @@ pub async fn export_subtitles(
         let lang = language.clone();
         db::with_db(&state.db, move |conn| db::get_translated_segments(conn, &rid, &lang))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     if translated.is_empty() {
         return Err("no translation available for this language yet — run Translate first".to_string());
@@ -520,14 +535,14 @@ pub async fn export_subtitles(
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::get_transcript_segments(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     if separate_files {
         let original_language = {
             let rid = recording_id.clone();
             db::with_db(&state.db, move |conn| db::get_recording_summary(conn, &rid))
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(log_err)?
                 .detected_language
                 .unwrap_or_else(|| "original".to_string())
         };
@@ -566,9 +581,9 @@ pub struct LlmSettingsResponse {
 pub async fn get_llm_settings(state: State<'_, AppState>) -> Result<LlmSettingsResponse, String> {
     let settings = db::with_db(&state.db, |conn| llm::load_settings(conn))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     let cloud_token_configured = llm::read_cloud_token()
-        .map_err(|e| e.to_string())?
+        .map_err(log_err)?
         .is_some();
     Ok(LlmSettingsResponse { settings, cloud_token_configured })
 }
@@ -580,22 +595,30 @@ pub async fn set_llm_settings(
 ) -> Result<(), String> {
     db::with_db(&state.db, move |conn| llm::save_settings(conn, &settings))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)?;
+    tracing::info!("LLM settings saved");
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn set_cloud_api_token(token: String) -> Result<(), String> {
-    llm::write_cloud_token(&token).map_err(|e| e.to_string())
+    // Never log the token itself -- only that one was set (CLAUDE.md: cloud
+    // tokens must never be logged).
+    llm::write_cloud_token(&token).map_err(log_err)?;
+    tracing::info!("cloud LLM API token saved");
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn clear_cloud_api_token() -> Result<(), String> {
-    llm::clear_cloud_token().map_err(|e| e.to_string())
+    llm::clear_cloud_token().map_err(log_err)?;
+    tracing::info!("cloud LLM API token cleared");
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn check_local_llm_connection(base_url: String) -> Result<(), String> {
-    llm::check_connection(&base_url).await.map_err(|e| e.to_string())
+    llm::check_connection(&base_url).await.map_err(log_err)
 }
 
 /// Validates that a transcript and a usable provider both exist, then
@@ -613,7 +636,7 @@ pub async fn generate_summary(
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::get_transcript_segments(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     if segments.is_empty() {
         return Err("no transcript available for this recording yet".to_string());
@@ -628,16 +651,17 @@ pub async fn generate_summary(
             db::set_recording_summary_language_override(conn, &rid, lang.as_deref())
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     }
 
     let job_id = {
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::insert_summarize_job(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     let _ = state.job_tx.send(job_id);
+    tracing::info!("summary requested for recording {recording_id}");
     Ok(())
 }
 
@@ -648,11 +672,11 @@ pub async fn generate_summary(
 async fn ensure_llm_provider_configured(state: &State<'_, AppState>) -> Result<(), String> {
     let settings = db::with_db(&state.db, |conn| llm::load_settings(conn))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     match settings.provider {
         ProviderKind::Cloud => {
             let has_token = llm::read_cloud_token()
-                .map_err(|e| e.to_string())?
+                .map_err(log_err)?
                 .is_some();
             if !has_token {
                 return Err("cloud provider selected but no API token is configured".to_string());
@@ -690,11 +714,11 @@ pub async fn get_translation_state(
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::list_translated_languages(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     let in_progress = db::with_db(&state.db, move |conn| db::has_active_translate_job(conn, &recording_id))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     Ok(TranslationStateResult { languages, in_progress })
 }
 
@@ -717,7 +741,7 @@ pub async fn translate_subtitles(
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::get_transcript_segments(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     if segments.is_empty() {
         return Err("no transcript available for this recording yet".to_string());
@@ -727,7 +751,7 @@ pub async fn translate_subtitles(
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::has_active_translate_job(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     if already_active {
         return Err("a translation is already in progress for this recording".to_string());
@@ -742,16 +766,17 @@ pub async fn translate_subtitles(
             db::set_recording_subtitle_language_override(conn, &rid, Some(&lang))
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?;
     }
 
     let job_id = {
         let rid = recording_id.clone();
         db::with_db(&state.db, move |conn| db::insert_translate_job(conn, &rid))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(log_err)?
     };
     let _ = state.job_tx.send(job_id);
+    tracing::info!("translation to \"{target_language}\" requested for recording {recording_id}");
     Ok(())
 }
 
@@ -799,7 +824,7 @@ pub async fn cancel_translation(state: State<'_, AppState>, recording_id: String
 pub async fn get_stt_settings(state: State<'_, AppState>) -> Result<SttSettings, String> {
     db::with_db(&state.db, |conn| stt::load_settings(conn))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 #[tauri::command]
@@ -813,19 +838,20 @@ pub async fn set_stt_settings(
         move |conn| stt::save_settings(conn, &settings)
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(log_err)?;
+    tracing::info!("STT settings saved");
     // The Settings window edits this independently of the main window's own
     // copy (each Tauri window is a separate webview/JS runtime) — broadcast
     // so the main window's recording-language picker stays in sync.
     app.emit("stt-settings-changed", &settings)
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 /// Opens (or refocuses) the Settings window — Speech recognition, Hotkeys,
 /// and LLM provider tabs, see `SettingsWindow.tsx`.
 #[tauri::command]
 pub async fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
-    settings_window::show(&app).map_err(|e| e.to_string())
+    settings_window::show(&app).map_err(log_err)
 }
 
 /// F6 live subtitles toggle — read at `start_recording` time (see
@@ -837,7 +863,7 @@ pub async fn get_live_subtitle_settings(
 ) -> Result<LiveSubtitlesSettings, String> {
     db::with_db(&state.db, |conn| live_subtitles::load_settings(conn))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 #[tauri::command]
@@ -849,7 +875,7 @@ pub async fn set_live_subtitle_settings(
         live_subtitles::save_settings(conn, &settings)
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(log_err)
 }
 
 /// Cheap, read-only dependency status (see `setup::check_all`) -- safe to
@@ -857,7 +883,7 @@ pub async fn set_live_subtitle_settings(
 /// tab opens, not just once at startup.
 #[tauri::command]
 pub async fn check_dependencies(app: tauri::AppHandle) -> Result<crate::setup::DependencyReport, String> {
-    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
+    let dir = crate::portable::app_data_dir(&app).map_err(log_err)?;
     Ok(crate::setup::check_all(&dir).await)
 }
 
@@ -882,7 +908,8 @@ pub async fn install_dependencies(
         *installing = true;
     }
 
-    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
+    tracing::info!("installing dependencies: {targets:?}");
+    let dir = crate::portable::app_data_dir(&app).map_err(log_err)?;
     let progress_app = app.clone();
     let result = crate::setup::install(&dir, &targets, move |progress| {
         let _ = progress_app.emit("dependency-install-progress", &progress);
@@ -890,7 +917,17 @@ pub async fn install_dependencies(
     .await;
 
     *state.installing.lock().await = false;
-    result.map_err(|e| e.to_string())?;
+    let result = match result {
+        Ok(()) => {
+            tracing::info!("dependencies installed: {targets:?}");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("dependency install failed for {targets:?}: {e:#}");
+            Err(e.to_string())
+        }
+    };
+    result?;
 
     let report = crate::setup::check_all(&dir).await;
     let _ = app.emit("dependencies-changed", &report);
@@ -903,7 +940,7 @@ pub async fn install_dependencies(
 /// safe to call every time the user clicks "Scan my PC," not just once.
 #[tauri::command]
 pub async fn scan_dependencies() -> Result<Vec<crate::setup::ScannedCandidate>, String> {
-    tauri::async_runtime::spawn_blocking(crate::setup::scan::scan_all).await.map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(crate::setup::scan::scan_all).await.map_err(log_err)
 }
 
 /// Opens the native folder picker for the user to point at an existing
@@ -914,7 +951,7 @@ pub async fn scan_dependencies() -> Result<Vec<crate::setup::ScannedCandidate>, 
 pub async fn pick_dependency_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder().map(|p| p.to_string()))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 /// Validates `folder` actually contains a working copy of `id`, then adopts
@@ -929,14 +966,15 @@ pub async fn use_dependency_path(
     path: String,
     source: crate::setup::DependencySource,
 ) -> Result<crate::setup::DependencyReport, String> {
-    let app_data_dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
+    let app_data_dir = crate::portable::app_data_dir(&app).map_err(log_err)?;
     let folder = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || crate::setup::apply_override(&app_data_dir, id, &folder, source))
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?
+        .map_err(log_err)?;
+    tracing::info!("dependency {id:?} pointed at {source:?} install");
 
-    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
+    let dir = crate::portable::app_data_dir(&app).map_err(log_err)?;
     let report = crate::setup::check_all(&dir).await;
     let _ = app.emit("dependencies-changed", &report);
     Ok(report)
@@ -949,13 +987,14 @@ pub async fn clear_dependency_override(
     app: tauri::AppHandle,
     id: crate::setup::DependencyId,
 ) -> Result<crate::setup::DependencyReport, String> {
-    let app_data_dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
+    let app_data_dir = crate::portable::app_data_dir(&app).map_err(log_err)?;
     tauri::async_runtime::spawn_blocking(move || crate::setup::clear_override(&app_data_dir, id))
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(log_err)?
+        .map_err(log_err)?;
+    tracing::info!("dependency {id:?} override cleared, reverted to bundled install");
 
-    let dir = crate::portable::app_data_dir(&app).map_err(|e| e.to_string())?;
+    let dir = crate::portable::app_data_dir(&app).map_err(log_err)?;
     let report = crate::setup::check_all(&dir).await;
     let _ = app.emit("dependencies-changed", &report);
     Ok(report)
@@ -968,7 +1007,7 @@ pub async fn get_summary(
 ) -> Result<Option<Summary>, String> {
     db::with_db(&state.db, move |conn| db::get_summary(conn, &recording_id))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(log_err)
 }
 
 /// Runs the fixed "optimized for web" HandBrakeCLI preset (format: MP4 web
@@ -1003,6 +1042,7 @@ pub async fn compress_recording(
     // "recording.mp4" -> "recording.web.mp4", saved alongside the original
     // rather than replacing it.
     let output_path = video_path.with_extension("web.mp4");
+    tracing::info!("compression started for recording {recording_id}");
 
     tauri::async_runtime::spawn(async move {
         let progress_app = app.clone();
@@ -1046,6 +1086,7 @@ pub async fn compress_recording(
                         "failed to persist compressed_path for recording {rid}: {e:#}"
                     ),
                 }
+                tracing::info!("compression finished for recording {recording_id}");
                 compress::CompressionFinished {
                     recording_id: recording_id.clone(),
                     status: "done",
@@ -1053,15 +1094,52 @@ pub async fn compress_recording(
                     message: None,
                 }
             }
-            Err(e) => compress::CompressionFinished {
-                recording_id: recording_id.clone(),
-                status: "failed",
-                output_path: None,
-                message: Some(format!("{e:#}")),
-            },
+            Err(e) => {
+                tracing::error!("compression failed for recording {recording_id}: {e:#}");
+                compress::CompressionFinished {
+                    recording_id: recording_id.clone(),
+                    status: "failed",
+                    output_path: None,
+                    message: Some(format!("{e:#}")),
+                }
+            }
         };
         let _ = app.emit("compression-finished", event);
     });
 
     Ok(())
+}
+
+/// Settings window "Download log" button: opens a save-file dialog and
+/// copies the current `<app_data_dir>/logs/app.log` (see `logging::init`) to
+/// the chosen location, so a user can hand it over when troubleshooting --
+/// especially the portable build's on-demand dependency downloads, which
+/// have no other visible trace once the progress bar disappears. Returns
+/// `None` if the user cancelled the dialog.
+#[tauri::command]
+pub async fn download_log(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let log_path = logging::log_file_path()
+        .ok_or_else(|| log_err("no log file available yet"))?;
+
+    let default_name = format!(
+        "screen-recorder-log-{}.log",
+        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+    );
+    let dest = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(&default_name)
+            .add_filter("Log file", &["log"])
+            .blocking_save_file()
+            .map(|p| p.to_string())
+    })
+    .await
+    .map_err(log_err)?;
+
+    let Some(dest_path) = dest else {
+        return Ok(None);
+    };
+    std::fs::copy(&log_path, &dest_path).map_err(log_err)?;
+    tracing::info!("log file exported to \"{dest_path}\"");
+    Ok(Some(dest_path))
 }

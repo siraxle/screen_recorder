@@ -37,6 +37,9 @@ function SettingsWindow() {
   const [connectionStatus, setConnectionStatus] = useState<string | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
 
+  const [logStatus, setLogStatus] = useState<string | null>(null);
+  const [downloadingLog, setDownloadingLog] = useState(false);
+
   useEffect(() => {
     invoke<SttSettings>("get_stt_settings")
       .then(setSttSettings)
@@ -142,9 +145,30 @@ function SettingsWindow() {
     setLlmSettings((prev) => ({ ...prev, cloudTokenConfigured: false }));
   }
 
+  async function handleDownloadLog() {
+    setDownloadingLog(true);
+    setLogStatus(null);
+    try {
+      const path = await invoke<string | null>("download_log");
+      setLogStatus(path ? `Saved to ${path}` : null);
+    } catch (e) {
+      setLogStatus(String(e));
+    } finally {
+      setDownloadingLog(false);
+    }
+  }
+
   return (
     <main className="container settings-window">
-      <h1>Settings</h1>
+      <div className="header-row">
+        <h1>Settings</h1>
+        <div className="controls">
+          <button disabled={downloadingLog} onClick={handleDownloadLog}>
+            {downloadingLog ? "Saving…" : "Download log"}
+          </button>
+          {logStatus && <span className="output"> {logStatus}</span>}
+        </div>
+      </div>
       <nav className="settings-tabs">
         {TABS.map((t) => (
           <button

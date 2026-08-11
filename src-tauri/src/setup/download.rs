@@ -19,13 +19,21 @@ pub async fn download_with_progress(
     dest: &Path,
     mut on_progress: impl FnMut(f64),
 ) -> Result<()> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to request {url}"))?
-        .error_for_status()
-        .with_context(|| format!("{url} returned an error status"))?;
+    tracing::info!("downloading dependency from {url} to {dest:?}");
+    let response = match client.get(url).send().await.with_context(|| format!("failed to request {url}")) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("dependency download request failed for {url}: {e:#}");
+            return Err(e);
+        }
+    };
+    let response = match response.error_for_status().with_context(|| format!("{url} returned an error status")) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("dependency download failed for {url}: {e:#}");
+            return Err(e);
+        }
+    };
     let total = response.content_length();
 
     if let Some(parent) = dest.parent() {
@@ -38,7 +46,13 @@ pub async fn download_with_progress(
     let mut downloaded: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("stream error downloading {url}"))?;
+        let chunk = match chunk.with_context(|| format!("stream error downloading {url}")) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("dependency download stream error for {url}: {e:#}");
+                return Err(e);
+            }
+        };
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         if let Some(total) = total {
@@ -49,6 +63,7 @@ pub async fn download_with_progress(
     }
     file.flush().await?;
     on_progress(1.0);
+    tracing::info!("finished downloading {url} ({downloaded} bytes) to {dest:?}");
     Ok(())
 }
 
@@ -61,6 +76,7 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     std::io::copy(&mut file, &mut hasher).with_context(|| format!("failed to hash {path:?}"))?;
     let actual = format!("{:x}", hasher.finalize());
     if !actual.eq_ignore_ascii_case(expected_hex) {
+        tracing::error!("checksum mismatch for {path:?}: expected {expected_hex}, got {actual}");
         return Err(anyhow!(
             "checksum mismatch for {path:?}: expected {expected_hex}, got {actual}"
         ));

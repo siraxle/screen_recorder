@@ -24,6 +24,7 @@ fn repo_python_dir() -> PathBuf {
 /// succeeds. A failure at any point leaves the previous `runtime/python/`
 /// (missing, or an older successful install) completely untouched.
 pub async fn install_interpreter_and_common(app_data_dir: &Path, on_progress: StageProgressFn) -> Result<()> {
+    tracing::info!("installing Python interpreter + common packages");
     let runtime_dir = paths::runtime_dir(app_data_dir);
     tokio::fs::create_dir_all(&runtime_dir).await?;
     download::check_free_space(
@@ -33,7 +34,8 @@ pub async fn install_interpreter_and_common(app_data_dir: &Path, on_progress: St
 
     let tmp = paths::tmp_component_dir(app_data_dir, "python");
     let result = try_install_into(&tmp, &on_progress).await;
-    if result.is_err() {
+    if let Err(e) = &result {
+        tracing::error!("Python interpreter install failed: {e:#}");
         let _ = std::fs::remove_dir_all(&tmp);
         return result;
     }
@@ -56,6 +58,7 @@ pub async fn install_interpreter_and_common(app_data_dir: &Path, on_progress: St
     fix_pyvenv_cfg_home(&final_dir, &tmp.join("interpreter"), &final_dir.join("interpreter")).await?;
 
     on_progress("done", 1.0);
+    tracing::info!("Python interpreter + common packages installed");
     Ok(())
 }
 
@@ -133,6 +136,7 @@ async fn try_install_into(tmp: &Path, on_progress: &StageProgressFn) -> Result<(
 /// partial GPU install just leaves the GPU marker unwritten and a retry is
 /// simply running the same pip install again).
 pub async fn install_gpu_packages(app_data_dir: &Path, on_progress: StageProgressFn) -> Result<()> {
+    tracing::info!("installing GPU packages into the bundled Python venv");
     let venv_dir = paths::python_venv_dir(app_data_dir);
     if !venv_dir.is_dir() {
         return Err(anyhow!("{venv_dir:?} doesn't exist -- install Python before GPU packages"));
@@ -141,10 +145,14 @@ pub async fn install_gpu_packages(app_data_dir: &Path, on_progress: StageProgres
 
     let venv_python = paths::venv_python_exe(app_data_dir);
     let requirements = repo_python_dir().join("requirements-gpu.txt");
-    run_pip_install(&venv_python, &requirements, &on_progress).await?;
+    if let Err(e) = run_pip_install(&venv_python, &requirements, &on_progress).await {
+        tracing::error!("GPU packages install failed: {e:#}");
+        return Err(e);
+    }
 
     paths::write_marker(&paths::python_gpu_marker(app_data_dir))?;
     on_progress("done", 1.0);
+    tracing::info!("GPU packages installed");
     Ok(())
 }
 
@@ -206,6 +214,7 @@ async fn run_pip_install(venv_python: &Path, requirements: &Path, on_progress: &
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     if !status.success() {
+        tracing::error!("pip install -r {requirements:?} exited with status {status}");
         return Err(anyhow!("pip install -r {requirements:?} exited with status {status}"));
     }
     on_progress("installing", 1.0);

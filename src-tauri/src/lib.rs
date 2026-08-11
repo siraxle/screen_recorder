@@ -4,6 +4,7 @@ mod compress;
 mod db;
 mod hotkeys;
 mod llm;
+mod logging;
 mod overlay;
 mod pipeline;
 mod portable;
@@ -20,8 +21,6 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt::init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -41,6 +40,9 @@ pub fn run() {
         )
         .setup(|app| {
             let app_data_dir = portable::app_data_dir(app)?;
+            logging::init(&app_data_dir);
+            tracing::info!("app starting, data dir: {}", app_data_dir.display());
+
             let db_path = app_data_dir.join("db.sqlite3");
             let db = db::open(&db_path).expect("failed to open recordings database");
 
@@ -165,6 +167,7 @@ pub fn run() {
             commands::pick_dependency_folder,
             commands::use_dependency_path,
             commands::clear_dependency_override,
+            commands::download_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
