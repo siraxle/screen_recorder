@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { EVENT_CLOSED, EVENT_OPENED } from "./annotation/types";
 import {
   EVENT_DEPENDENCIES_CHANGED,
@@ -251,6 +251,14 @@ function formatCreatedAt(createdAt: string): string {
 
 function displayName(recording: RecordingSummary): string {
   return recording.title || formatCreatedAt(recording.createdAt);
+}
+
+function PlayIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M6 4.5v15l13-7.5Z" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
 }
 
 function RenameIcon() {
@@ -912,6 +920,14 @@ function App() {
     }
   }
 
+  async function handlePlayRecording(recording: RecordingSummary) {
+    try {
+      await openPath(recording.videoPath);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function handleOpenRecordingFolder(recording: RecordingSummary) {
     try {
       await revealItemInDir(recording.videoPath);
@@ -1076,7 +1092,6 @@ function App() {
                       </span>
                     ) : (
                       <span className="row-actions">
-                        <span className="recording-name">{displayName(recording)}</span>
                         <button
                           className="icon-btn"
                           title="Rename"
@@ -1085,6 +1100,7 @@ function App() {
                         >
                           <RenameIcon />
                         </button>
+                        <span className="recording-name">{displayName(recording)}</span>
                       </span>
                     )}
                   </td>
@@ -1101,6 +1117,14 @@ function App() {
                     )}
                   </td>
                   <td className="row-actions" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      className="icon-btn"
+                      title="Play"
+                      aria-label="Play"
+                      onClick={() => handlePlayRecording(recording)}
+                    >
+                      <PlayIcon />
+                    </button>
                     <button
                       className={
                         "icon-btn" + (recording.compressedPath ? " compressed" : "")
