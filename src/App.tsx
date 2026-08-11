@@ -1052,6 +1052,7 @@ function App() {
           <p className="output">No recordings yet.</p>
         )}
         {searchResults === null && recordings.length > 0 && (
+          <div className="recordings-table-wrapper">
           <table className="recordings-table">
             <thead>
               <tr>
@@ -1166,6 +1167,7 @@ function App() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </section>
 

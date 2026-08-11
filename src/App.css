@@ -364,6 +364,12 @@ code {
   font-family: "Consolas", "SFMono-Regular", Menlo, monospace;
 }
 
+.recordings-table-wrapper {
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+}
+
 .recordings-table {
   width: 100%;
   table-layout: auto;
@@ -394,7 +400,6 @@ code {
 .recordings-table th:last-child,
 .recordings-table td:last-child {
   width: 1%;
-  white-space: nowrap;
 }
 
 .recordings-table tbody tr {
