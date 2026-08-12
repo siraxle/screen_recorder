@@ -197,6 +197,8 @@ const SUBTITLE_LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
   ...LANGUAGE_OPTIONS.slice(1),
 ];
 
+const RECORDINGS_PAGE_SIZE = 20;
+
 const PIPELINE_LABEL: Record<PipelineStatus, string> = {
   recorded: "Awaiting transcription…",
   transcribing: "Transcribing…",
@@ -312,6 +314,7 @@ function App() {
   const [annotationOverlayVisible, setAnnotationOverlayVisible] = useState(false);
 
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
+  const [recordingsPage, setRecordingsPage] = useState(0);
   const [pipeline, setPipeline] = useState<RecordingSummary | null>(null);
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState<string>("");
@@ -420,6 +423,11 @@ function App() {
   useEffect(() => {
     refreshRecordings();
   }, []);
+
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(recordings.length / RECORDINGS_PAGE_SIZE));
+    if (recordingsPage > totalPages - 1) setRecordingsPage(totalPages - 1);
+  }, [recordings, recordingsPage]);
 
   // Debounced live search (F11): re-queries 300ms after the user stops
   // typing rather than on every keystroke, and clears results (rather than
@@ -1052,6 +1060,7 @@ function App() {
           <p className="output">No recordings yet.</p>
         )}
         {searchResults === null && recordings.length > 0 && (
+          <>
           <div className="recordings-table-wrapper">
           <table className="recordings-table">
             <thead>
@@ -1064,7 +1073,12 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {recordings.map((recording) => (
+              {recordings
+                .slice(
+                  recordingsPage * RECORDINGS_PAGE_SIZE,
+                  recordingsPage * RECORDINGS_PAGE_SIZE + RECORDINGS_PAGE_SIZE
+                )
+                .map((recording) => (
                 <tr
                   key={recording.id}
                   className={recording.id === pipeline?.id ? "selected" : undefined}
@@ -1168,7 +1182,34 @@ function App() {
             </tbody>
           </table>
           </div>
-        )}
+          {recordings.length > RECORDINGS_PAGE_SIZE && (
+            <div className="pagination-row">
+              <button
+                disabled={recordingsPage === 0}
+                onClick={() => setRecordingsPage((p) => Math.max(0, p - 1))}
+              >
+                ← Prev
+              </button>
+              <span>
+                Page {recordingsPage + 1} of{" "}
+                {Math.max(1, Math.ceil(recordings.length / RECORDINGS_PAGE_SIZE))}
+              </span>
+              <button
+                disabled={
+                  recordingsPage >= Math.ceil(recordings.length / RECORDINGS_PAGE_SIZE) - 1
+                }
+                onClick={() =>
+                  setRecordingsPage((p) =>
+                    Math.min(Math.ceil(recordings.length / RECORDINGS_PAGE_SIZE) - 1, p + 1)
+                  )
+                }
+              >
+                Next →
+              </button>
+            </div>
+          )}
+        </>
+      )}
       </section>
 
       <section className="panel">

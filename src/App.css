@@ -440,6 +440,16 @@ code {
   min-width: 0;
 }
 
+.pagination-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.8rem;
+  margin-top: 0.6rem;
+  font-size: 0.9em;
+  color: var(--sw-text-dim);
+}
+
 .compress-progress {
   color: var(--sw-text-dim);
   font-size: 0.9em;
