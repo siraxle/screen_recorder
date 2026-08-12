@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -22,6 +23,63 @@ pub fn spawn_stderr_drain(stderr: ChildStderr, label: String) -> tokio::task::Jo
             }
         }
     })
+}
+
+/// Last number of stderr lines kept by `spawn_stderr_capture`, enough to
+/// cover ffmpeg's actual error output (which usually lands in the final few
+/// lines before it exits) without holding a whole run's progress spam.
+const STDERR_TAIL_LINES: usize = 20;
+
+/// Like `spawn_stderr_drain`, but also keeps the last `STDERR_TAIL_LINES`
+/// lines in memory so a failing process's real error can be attached to the
+/// `Result` we return on non-zero exit. ffmpeg's failure reason only ever
+/// appears on stderr, and `spawn_stderr_drain` logs it at `debug!` -- below
+/// the default `info` filter (see `logging::env_filter`) -- so without this,
+/// a crash surfaces only as a bare, unexplained exit code.
+pub fn spawn_stderr_capture(
+    stderr: ChildStderr,
+    label: String,
+) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let tail_writer = tail.clone();
+    let handle = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    tracing::debug!(target: "ffmpeg", "[{label}] {line}");
+                    let mut buf = tail_writer.lock().unwrap();
+                    buf.push(line);
+                    let excess = buf.len().saturating_sub(STDERR_TAIL_LINES);
+                    if excess > 0 {
+                        buf.drain(0..excess);
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+    (handle, tail)
+}
+
+/// Joins the captured tail lines into a single string for error messages.
+pub fn stderr_tail(tail: &Mutex<Vec<String>>) -> String {
+    tail.lock().unwrap().join("\n")
+}
+
+/// Whether ffmpeg's stderr shows it finished writing the output file (the
+/// final `Lsize=` progress line, printed once when the muxer closes)
+/// *despite* the process then exiting with a non-zero status.
+///
+/// Quitting a process that combines gdigrab + a dshow audio device (see
+/// `build_segment_command`) via `q` is a known Windows race: the dshow
+/// input thread can report a transient `EAGAIN` after the muxer has already
+/// flushed and closed the file, which makes ffmpeg's own exit code reflect
+/// that error even though the output is complete and playable. Treating
+/// every non-zero exit as fatal in that case would discard footage that
+/// already exists on disk.
+pub fn finished_writing_output(stderr_tail: &str) -> bool {
+    stderr_tail.contains("Lsize=")
 }
 
 /// Spawns a short-lived ffmpeg command (mux/concat passes), drains its

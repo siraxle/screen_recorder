@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -27,6 +28,10 @@ struct ActiveSegment {
     video_child: Child,
     video_path: PathBuf,
     video_start: Instant,
+    /// Tail of the video/mic ffmpeg process's stderr, kept so a non-zero
+    /// exit can be reported with its actual error instead of a bare status
+    /// code (see `ffmpeg::spawn_stderr_capture`).
+    video_stderr: Arc<Mutex<Vec<String>>>,
     /// F16: the webcam feed is captured by its own plain, filter-free ffmpeg
     /// process (see `ffmpeg::build_webcam_segment_command`) rather than
     /// composited live alongside the desktop capture -- two independent
@@ -34,7 +39,7 @@ struct ActiveSegment {
     /// design stutter waiting on whichever was slower. `webcam_start` is
     /// used to align the two files in the post-stop compositing pass (see
     /// `finish_segment`).
-    webcam: Option<(Child, PathBuf, Instant)>,
+    webcam: Option<(Child, PathBuf, Instant, Arc<Mutex<Vec<String>>>)>,
     loopback: Option<LoopbackCapture>,
     loopback_pcm_path: Option<PathBuf>,
     has_mic_track: bool,
@@ -183,9 +188,11 @@ impl CaptureController {
         let mut video_child = cmd
             .spawn()
             .context("failed to spawn ffmpeg for video/mic capture")?;
-        if let Some(stderr) = video_child.stderr.take() {
-            ffmpeg::spawn_stderr_drain(stderr, format!("segment-{}", self.segment_index));
-        }
+        let video_stderr = video_child
+            .stderr
+            .take()
+            .map(|stderr| ffmpeg::spawn_stderr_capture(stderr, format!("segment-{}", self.segment_index)).1)
+            .unwrap_or_default();
 
         // F16: webcam is its own process (see `ActiveSegment::webcam` doc
         // comment) so it's spawned right alongside the desktop capture
@@ -199,13 +206,14 @@ impl CaptureController {
             let mut webcam_child = webcam_cmd
                 .spawn()
                 .context("failed to spawn ffmpeg for webcam capture")?;
-            if let Some(stderr) = webcam_child.stderr.take() {
-                ffmpeg::spawn_stderr_drain(
-                    stderr,
-                    format!("segment-{}-webcam", self.segment_index),
-                );
-            }
-            Some((webcam_child, webcam_path, webcam_start))
+            let webcam_stderr = webcam_child
+                .stderr
+                .take()
+                .map(|stderr| {
+                    ffmpeg::spawn_stderr_capture(stderr, format!("segment-{}-webcam", self.segment_index)).1
+                })
+                .unwrap_or_default();
+            Some((webcam_child, webcam_path, webcam_start, webcam_stderr))
         } else {
             None
         };
@@ -225,6 +233,7 @@ impl CaptureController {
             video_child,
             video_path,
             video_start,
+            video_stderr,
             webcam,
             loopback,
             loopback_pcm_path,
@@ -250,9 +259,19 @@ impl CaptureController {
         }
 
         if !status.success() {
-            return Err(anyhow!(
-                "ffmpeg (video/mic capture) exited with status {status}"
-            ));
+            let tail = ffmpeg::stderr_tail(&segment.video_stderr);
+            if ffmpeg::finished_writing_output(&tail) {
+                tracing::warn!(
+                    "ffmpeg (video/mic capture) exited with status {status} after it finished \
+                     writing the output file (known dshow-quit race on Windows) -- keeping the \
+                     recording\n{tail}"
+                );
+            } else {
+                return Err(anyhow!(
+                    "ffmpeg (video/mic capture) exited with status {status}{}",
+                    if tail.is_empty() { String::new() } else { format!("\n{tail}") }
+                ));
+            }
         }
 
         // F16: composite the webcam feed onto the desktop video now that
@@ -261,7 +280,7 @@ impl CaptureController {
         // offline (not racing either device's real-time frame delivery) is
         // what actually fixes the choppiness.
         let video_path = match segment.webcam.take() {
-            Some((mut webcam_child, webcam_path, webcam_start)) => {
+            Some((mut webcam_child, webcam_path, webcam_start, webcam_stderr)) => {
                 if let Some(mut stdin) = webcam_child.stdin.take() {
                     let _ = stdin.write_all(b"q").await;
                 }
@@ -270,9 +289,19 @@ impl CaptureController {
                     .await
                     .context("failed to wait for webcam ffmpeg process")?;
                 if !webcam_status.success() {
-                    return Err(anyhow!(
-                        "ffmpeg (webcam capture) exited with status {webcam_status}"
-                    ));
+                    let tail = ffmpeg::stderr_tail(&webcam_stderr);
+                    if ffmpeg::finished_writing_output(&tail) {
+                        tracing::warn!(
+                            "ffmpeg (webcam capture) exited with status {webcam_status} after it \
+                             finished writing the output file (known dshow-quit race on Windows) \
+                             -- keeping the recording\n{tail}"
+                        );
+                    } else {
+                        return Err(anyhow!(
+                            "ffmpeg (webcam capture) exited with status {webcam_status}{}",
+                            if tail.is_empty() { String::new() } else { format!("\n{tail}") }
+                        ));
+                    }
                 }
 
                 // Neither process is guaranteed to start first -- gdigrab
