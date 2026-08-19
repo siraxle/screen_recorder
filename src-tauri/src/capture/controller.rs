@@ -25,13 +25,18 @@ pub enum RecordingStatus {
 /// this is what "pause without losing the already-recorded fragment" means
 /// in practice (see F1 in screen-recorder-spec.md).
 struct ActiveSegment {
-    video_child: Child,
-    video_path: PathBuf,
+    /// The gdigrab/dshow ffmpeg process for this segment's desktop video
+    /// and/or microphone, or `None` when neither is being captured -- an
+    /// audio-only recording (see `CaptureConfig::capture_video`) with only
+    /// system audio enabled needs no ffmpeg process here at all, since the
+    /// WASAPI loopback capture (`loopback` below) runs independently.
+    primary_child: Option<Child>,
+    primary_path: Option<PathBuf>,
     video_start: Instant,
-    /// Tail of the video/mic ffmpeg process's stderr, kept so a non-zero
-    /// exit can be reported with its actual error instead of a bare status
-    /// code (see `ffmpeg::spawn_stderr_capture`).
-    video_stderr: Arc<Mutex<Vec<String>>>,
+    /// Tail of the primary ffmpeg process's stderr, kept so a non-zero exit
+    /// can be reported with its actual error instead of a bare status code
+    /// (see `ffmpeg::spawn_stderr_capture`).
+    primary_stderr: Arc<Mutex<Vec<String>>>,
     /// F16: the webcam feed is captured by its own plain, filter-free ffmpeg
     /// process (see `ffmpeg::build_webcam_segment_command`) rather than
     /// composited live alongside the desktop capture -- two independent
@@ -155,9 +160,15 @@ impl CaptureController {
 
     async fn begin_segment(&mut self) -> Result<()> {
         self.segment_index += 1;
-        let video_path = self
-            .work_dir
-            .join(format!("segment-{:03}-video.mp4", self.segment_index));
+
+        if !self.config.capture_video
+            && !self.config.capture_microphone
+            && !self.config.capture_system_audio
+        {
+            return Err(anyhow!(
+                "select at least one video or audio source before recording"
+            ));
+        }
 
         // dshow has no "OS default microphone" device name, so an unset
         // `microphone_device` is resolved here to a concrete device rather
@@ -173,8 +184,10 @@ impl CaptureController {
 
         // Same auto-resolve as the microphone above, for F16's webcam
         // overlay: an unset `webcam.device` picks the first camera ffmpeg
-        // enumerates.
-        if self.config.webcam.enabled && self.config.webcam.device.is_none() {
+        // enumerates. The webcam overlay is meaningless without desktop
+        // video, so it's ignored outright in audio-only recordings rather
+        // than trusting the caller never to send that combination.
+        if self.config.capture_video && self.config.webcam.enabled && self.config.webcam.device.is_none() {
             let cameras = ffmpeg::list_cameras()
                 .await
                 .context("failed to enumerate cameras")?;
@@ -183,21 +196,34 @@ impl CaptureController {
             })?);
         }
 
-        let mut cmd = ffmpeg::build_segment_command(&self.config, &video_path);
+        // No ffmpeg process is needed here at all when neither desktop video
+        // nor the microphone is being captured -- an audio-only recording
+        // with just system audio relies solely on `loopback` below.
+        let has_primary = self.config.capture_video || self.config.capture_microphone;
+        let (primary_child, primary_path, primary_stderr) = if has_primary {
+            let label = if self.config.capture_video { "video" } else { "audio" };
+            let primary_path = self
+                .work_dir
+                .join(format!("segment-{:03}-{label}.mp4", self.segment_index));
+            let mut cmd = ffmpeg::build_segment_command(&self.config, &primary_path);
+            let mut child = cmd
+                .spawn()
+                .context("failed to spawn ffmpeg for video/mic capture")?;
+            let stderr = child
+                .stderr
+                .take()
+                .map(|stderr| ffmpeg::spawn_stderr_capture(stderr, format!("segment-{}", self.segment_index)).1)
+                .unwrap_or_default();
+            (Some(child), Some(primary_path), stderr)
+        } else {
+            (None, None, Arc::new(Mutex::new(Vec::new())))
+        };
         let video_start = Instant::now();
-        let mut video_child = cmd
-            .spawn()
-            .context("failed to spawn ffmpeg for video/mic capture")?;
-        let video_stderr = video_child
-            .stderr
-            .take()
-            .map(|stderr| ffmpeg::spawn_stderr_capture(stderr, format!("segment-{}", self.segment_index)).1)
-            .unwrap_or_default();
 
         // F16: webcam is its own process (see `ActiveSegment::webcam` doc
         // comment) so it's spawned right alongside the desktop capture
         // rather than as a second input inside the same command.
-        let webcam = if self.config.webcam.enabled {
+        let webcam = if self.config.capture_video && self.config.webcam.enabled {
             let webcam_path = self
                 .work_dir
                 .join(format!("segment-{:03}-webcam.mp4", self.segment_index));
@@ -230,10 +256,10 @@ impl CaptureController {
         };
 
         self.active = Some(ActiveSegment {
-            video_child,
-            video_path,
+            primary_child,
+            primary_path,
             video_start,
-            video_stderr,
+            primary_stderr,
             webcam,
             loopback,
             loopback_pcm_path,
@@ -244,33 +270,42 @@ impl CaptureController {
 
     async fn finish_segment(&self, mut segment: ActiveSegment) -> Result<PathBuf> {
         // ffmpeg reads 'q' from stdin as a graceful-stop request even when
-        // stdin is a pipe rather than a real console.
-        if let Some(mut stdin) = segment.video_child.stdin.take() {
-            let _ = stdin.write_all(b"q").await;
-        }
-        let status = segment
-            .video_child
-            .wait()
-            .await
-            .context("failed to wait for video/mic ffmpeg process")?;
+        // stdin is a pipe rather than a real console. There's nothing to stop
+        // here when this segment captured only system audio (no video, no
+        // mic) -- see `ActiveSegment::primary_child`'s doc comment.
+        let primary_status = if let Some(mut child) = segment.primary_child.take() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b"q").await;
+            }
+            Some(
+                child
+                    .wait()
+                    .await
+                    .context("failed to wait for video/mic ffmpeg process")?,
+            )
+        } else {
+            None
+        };
 
         if let Some(loopback) = segment.loopback.take() {
             loopback.stop()?;
         }
 
-        if !status.success() {
-            let tail = ffmpeg::stderr_tail(&segment.video_stderr);
-            if ffmpeg::finished_writing_output(&tail) {
-                tracing::warn!(
-                    "ffmpeg (video/mic capture) exited with status {status} after it finished \
-                     writing the output file (known dshow-quit race on Windows) -- keeping the \
-                     recording\n{tail}"
-                );
-            } else {
-                return Err(anyhow!(
-                    "ffmpeg (video/mic capture) exited with status {status}{}",
-                    if tail.is_empty() { String::new() } else { format!("\n{tail}") }
-                ));
+        if let Some(status) = primary_status {
+            if !status.success() {
+                let tail = ffmpeg::stderr_tail(&segment.primary_stderr);
+                if ffmpeg::finished_writing_output(&tail) {
+                    tracing::warn!(
+                        "ffmpeg (video/mic capture) exited with status {status} after it finished \
+                         writing the output file (known dshow-quit race on Windows) -- keeping the \
+                         recording\n{tail}"
+                    );
+                } else {
+                    return Err(anyhow!(
+                        "ffmpeg (video/mic capture) exited with status {status}{}",
+                        if tail.is_empty() { String::new() } else { format!("\n{tail}") }
+                    ));
+                }
             }
         }
 
@@ -279,8 +314,15 @@ impl CaptureController {
         // `ffmpeg::build_webcam_composite_command` for why running this
         // offline (not racing either device's real-time frame delivery) is
         // what actually fixes the choppiness.
-        let video_path = match segment.webcam.take() {
+        let primary_path: Option<PathBuf> = match segment.webcam.take() {
             Some((mut webcam_child, webcam_path, webcam_start, webcam_stderr)) => {
+                // The webcam overlay is only ever enabled alongside desktop
+                // video capture (see `begin_segment`), so `primary_path` is
+                // guaranteed to be set here.
+                let desktop_path = segment
+                    .primary_path
+                    .clone()
+                    .expect("webcam overlay requires desktop video capture");
                 if let Some(mut stdin) = webcam_child.stdin.take() {
                     let _ = stdin.write_all(b"q").await;
                 }
@@ -322,7 +364,7 @@ impl CaptureController {
                     .join(format!("segment-{:03}-composited.mp4", self.segment_index));
                 ffmpeg::run_to_completion(
                     ffmpeg::build_webcam_composite_command(
-                        &segment.video_path,
+                        &desktop_path,
                         &webcam_path,
                         &self.config.webcam,
                         desktop_offset,
@@ -333,20 +375,21 @@ impl CaptureController {
                     "webcam-composite",
                 )
                 .await?;
-                composited_path
+                Some(composited_path)
             }
-            None => segment.video_path.clone(),
+            None => segment.primary_path.clone(),
         };
 
-        match segment.loopback_pcm_path {
-            Some(pcm_path) => {
+        match (primary_path, segment.loopback_pcm_path) {
+            (Some(primary_path), Some(pcm_path)) => {
                 let muxed_path = self
                     .work_dir
                     .join(format!("segment-{:03}-final.mp4", self.segment_index));
                 ffmpeg::run_to_completion(
                     ffmpeg::build_mux_command(
-                        &video_path,
+                        &primary_path,
                         &pcm_path,
+                        self.config.capture_video,
                         segment.has_mic_track,
                         &muxed_path,
                     ),
@@ -355,7 +398,23 @@ impl CaptureController {
                 .await?;
                 Ok(muxed_path)
             }
-            None => Ok(video_path),
+            (Some(primary_path), None) => Ok(primary_path),
+            (None, Some(pcm_path)) => {
+                // Audio-only recording with system audio as its sole source
+                // (no video, no mic) -- there's no `primary_path` at all to
+                // mux against, just encode the loopback PCM straight into the
+                // segment's output container.
+                let output_path = self
+                    .work_dir
+                    .join(format!("segment-{:03}-final.mp4", self.segment_index));
+                ffmpeg::run_to_completion(
+                    ffmpeg::build_audio_only_mux_command(&pcm_path, &output_path),
+                    "audio-mux",
+                )
+                .await?;
+                Ok(output_path)
+            }
+            (None, None) => Err(anyhow!("segment produced no audio or video output")),
         }
     }
 }
@@ -382,6 +441,7 @@ mod tests {
             capture_microphone: false,
             microphone_device: None,
             framerate: 10,
+            capture_video: true,
             webcam: WebcamOverlayConfig::default(),
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
@@ -432,11 +492,47 @@ mod tests {
             capture_microphone: false,
             microphone_device: None,
             framerate: 10,
+            capture_video: true,
             webcam: WebcamOverlayConfig {
                 enabled: true,
                 device: Some(device),
                 ..WebcamOverlayConfig::default()
             },
+        };
+        let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
+
+        controller.start().await.expect("start should succeed");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let output_path = base_dir.join("output.mp4");
+        let result = controller
+            .stop(&output_path)
+            .await
+            .expect("stop should succeed and produce a file");
+
+        assert!(result.exists(), "output file must exist");
+        let size = std::fs::metadata(&result).unwrap().len();
+        assert!(size > 1000, "output file is suspiciously small: {size} bytes");
+    }
+
+    /// Audio-only recording (`capture_video: false`) with system audio as
+    /// the sole source -- exercises the `(None, Some(pcm_path))` branch of
+    /// `finish_segment`, which has no ffmpeg process for desktop video/mic at
+    /// all and instead encodes the WASAPI loopback PCM straight into the
+    /// output container (see `ffmpeg::build_audio_only_mux_command`).
+    #[tokio::test]
+    async fn records_audio_only_with_system_audio_and_produces_playable_output() {
+        let base_dir = std::env::temp_dir().join("screen_recorder_audio_only_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let config = CaptureConfig {
+            capture_system_audio: true,
+            capture_microphone: false,
+            microphone_device: None,
+            framerate: 10,
+            capture_video: false,
+            webcam: WebcamOverlayConfig::default(),
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 

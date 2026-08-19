@@ -14,11 +14,24 @@ pub struct CaptureConfig {
     /// `None` lets the OS-default microphone be used.
     pub microphone_device: Option<String>,
     pub framerate: u32,
+    /// Whether this recording captures desktop video at all. `false` records
+    /// audio only (system audio and/or microphone, whichever is enabled),
+    /// producing an audio-only .mp4 with no video stream -- see
+    /// `ffmpeg::build_segment_command`. Defaults to `true` so existing
+    /// screen-recording behavior is unaffected. The webcam overlay requires
+    /// video and is ignored when this is `false` (see
+    /// `CaptureController::begin_segment`).
+    #[serde(default = "default_capture_video")]
+    pub capture_video: bool,
     /// F16 webcam picture-in-picture overlay, composited live into the
     /// desktop capture (see `ffmpeg::build_segment_command`). Disabled by
     /// default so a plain screen recording is unaffected.
     #[serde(default)]
     pub webcam: WebcamOverlayConfig,
+}
+
+fn default_capture_video() -> bool {
+    true
 }
 
 impl Default for CaptureConfig {
@@ -28,6 +41,7 @@ impl Default for CaptureConfig {
             capture_microphone: true,
             microphone_device: None,
             framerate: 30,
+            capture_video: true,
             webcam: WebcamOverlayConfig::default(),
         }
     }

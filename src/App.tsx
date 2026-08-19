@@ -43,6 +43,7 @@ interface CaptureConfig {
   captureMicrophone: boolean;
   microphoneDevice: string | null;
   framerate: number;
+  captureVideo: boolean;
   webcam: WebcamOverlayConfig;
 }
 
@@ -299,6 +300,7 @@ function DeleteIcon() {
 function App() {
   const [status, setStatus] = useState<RecordingStatus>("stopped");
   const [microphones, setMicrophones] = useState<string[]>([]);
+  const [captureVideo, setCaptureVideo] = useState(true);
   const [captureSystemAudio, setCaptureSystemAudio] = useState(true);
   const [captureMicrophone, setCaptureMicrophone] = useState(true);
   const [microphoneDevice, setMicrophoneDevice] = useState<string>("");
@@ -403,6 +405,15 @@ function App() {
       .then((s) => setLiveSubtitlesEnabled(s.enabled))
       .catch((e) => setError(String(e)));
   }, []);
+
+  // The webcam overlay is composited onto the desktop video and is
+  // meaningless without it -- switching to audio-only turns it back off
+  // rather than leaving a stale "enabled" checkbox the backend will ignore
+  // anyway (see CaptureController::begin_segment).
+  useEffect(() => {
+    if (!captureVideo && webcamEnabled) setWebcamEnabled(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureVideo]);
 
   // Parakeet has no "Auto-detect"/"Other" entries (see PARAKEET_LANGUAGE_OPTIONS),
   // so switching engines away from Whisper while either is selected would
@@ -772,9 +783,10 @@ function App() {
       captureMicrophone,
       microphoneDevice: captureMicrophone && microphoneDevice ? microphoneDevice : null,
       framerate: 30,
+      captureVideo,
       webcam: {
-        enabled: webcamEnabled,
-        device: webcamEnabled && webcamDevice ? webcamDevice : null,
+        enabled: captureVideo && webcamEnabled,
+        device: captureVideo && webcamEnabled && webcamDevice ? webcamDevice : null,
         shape: webcamShape,
         corner: webcamCorner,
       },
@@ -1216,6 +1228,21 @@ function App() {
         <label className="checkbox-row">
           <input
             type="checkbox"
+            checked={captureVideo}
+            disabled={status !== "stopped"}
+            onChange={(e) => setCaptureVideo(e.currentTarget.checked)}
+          />
+          Record video
+        </label>
+        {!captureVideo && (
+          <p className="output">
+            Audio-only recording — only the audio sources selected below will be captured.
+          </p>
+        )}
+
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
             checked={captureMicrophone}
             disabled={status !== "stopped"}
             onChange={(e) => setCaptureMicrophone(e.currentTarget.checked)}
@@ -1247,6 +1274,7 @@ function App() {
           System audio (WASAPI loopback)
         </label>
 
+        {captureVideo && (
         <label className="checkbox-row">
           <input
             type="checkbox"
@@ -1256,7 +1284,8 @@ function App() {
           />
           Webcam overlay
         </label>
-        {webcamEnabled && (
+        )}
+        {captureVideo && webcamEnabled && (
           <>
             <select
               value={webcamDevice}
@@ -1345,11 +1374,17 @@ function App() {
             onChange={(e) => setCustomLanguage(e.currentTarget.value)}
           />
         )}
+        {!captureVideo && !captureMicrophone && !captureSystemAudio && (
+          <p className="output">Select at least one video or audio source to start recording.</p>
+        )}
       </section>
 
       <section className="controls">
         {status === "stopped" && (
-          <button disabled={busy} onClick={handleStart}>
+          <button
+            disabled={busy || (!captureVideo && !captureMicrophone && !captureSystemAudio)}
+            onClick={handleStart}
+          >
             Start Recording
           </button>
         )}

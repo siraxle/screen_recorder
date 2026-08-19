@@ -123,22 +123,31 @@ pub async fn run_to_completion(mut cmd: Command, label: &str) -> Result<()> {
 /// `+frag_keyframe+empty_moov` makes the mp4 playable even if the process is
 /// killed instead of stopped gracefully — segment boundaries (pause/resume)
 /// must never corrupt already-recorded footage.
+/// Only called when `config.capture_video || config.capture_microphone`
+/// (see `CaptureController::begin_segment`) -- an audio-only recording with
+/// just system audio never spawns this process at all, since the WASAPI
+/// loopback capture (`system_audio.rs`) runs independently of ffmpeg.
 #[cfg(target_os = "windows")]
 pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Command {
     let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
-    cmd.arg("-y").arg("-f").arg("gdigrab");
-    if config.webcam.enabled {
-        // Only needed when a webcam track will later be composited against
-        // this one (see `build_webcam_composite_command`) -- tags each frame
-        // with real wall-clock time instead of an assumed-continuous
-        // frame-index PTS, which is what lets the offline compose pass align
-        // two independently-started capture processes correctly.
-        cmd.arg("-use_wallclock_as_timestamps").arg("1");
+    cmd.arg("-y");
+
+    if config.capture_video {
+        cmd.arg("-f").arg("gdigrab");
+        if config.webcam.enabled {
+            // Only needed when a webcam track will later be composited
+            // against this one (see `build_webcam_composite_command`) --
+            // tags each frame with real wall-clock time instead of an
+            // assumed-continuous frame-index PTS, which is what lets the
+            // offline compose pass align two independently-started capture
+            // processes correctly.
+            cmd.arg("-use_wallclock_as_timestamps").arg("1");
+        }
+        cmd.arg("-framerate")
+            .arg(config.framerate.to_string())
+            .arg("-i")
+            .arg("desktop");
     }
-    cmd.arg("-framerate")
-        .arg(config.framerate.to_string())
-        .arg("-i")
-        .arg("desktop");
 
     if config.capture_microphone {
         let mic = config
@@ -153,14 +162,15 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
             .arg(format!("audio={mic}"));
     }
 
-    cmd.arg("-c:v")
-        .arg("libx264")
-        .arg("-preset")
-        .arg("ultrafast")
-        .arg("-pix_fmt")
-        .arg("yuv420p")
-        .arg("-movflags")
-        .arg("+frag_keyframe+empty_moov");
+    if config.capture_video {
+        cmd.arg("-c:v")
+            .arg("libx264")
+            .arg("-preset")
+            .arg("ultrafast")
+            .arg("-pix_fmt")
+            .arg("yuv420p");
+    }
+    cmd.arg("-movflags").arg("+frag_keyframe+empty_moov");
 
     if config.capture_microphone {
         cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k");
@@ -367,17 +377,20 @@ pub fn build_webcam_composite_command(
 /// Muxes a recorded segment with its separately-captured system-audio track
 /// (raw interleaved f32le PCM, see `system_audio.rs`). If the segment has no
 /// microphone track, the loopback audio becomes the sole audio track;
-/// otherwise the two are mixed together.
+/// otherwise the two are mixed together. `has_video` is `false` for an
+/// audio-only recording (see `CaptureConfig::capture_video`) whose primary
+/// input is a mic-only capture with no video stream to map or copy.
 pub fn build_mux_command(
-    segment_video_path: &Path,
+    primary_path: &Path,
     loopback_pcm_path: &Path,
+    has_video: bool,
     has_mic_track: bool,
     output_path: &Path,
 ) -> Command {
     let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y")
         .arg("-i")
-        .arg(segment_video_path)
+        .arg(primary_path)
         .arg("-f")
         .arg("f32le")
         .arg("-ar")
@@ -389,17 +402,48 @@ pub fn build_mux_command(
 
     if has_mic_track {
         cmd.arg("-filter_complex")
-            .arg("[0:a][1:a]amix=inputs=2:duration=longest[aout]")
-            .arg("-map")
-            .arg("0:v")
-            .arg("-map")
-            .arg("[aout]");
-    } else {
+            .arg("[0:a][1:a]amix=inputs=2:duration=longest[aout]");
+        if has_video {
+            cmd.arg("-map").arg("0:v");
+        }
+        cmd.arg("-map").arg("[aout]");
+    } else if has_video {
         cmd.arg("-map").arg("0:v").arg("-map").arg("1:a");
+    } else {
+        cmd.arg("-map").arg("1:a");
     }
 
-    cmd.arg("-c:v")
-        .arg("copy")
+    if has_video {
+        cmd.arg("-c:v").arg("copy");
+    }
+    cmd.arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("160k")
+        .arg(output_path);
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Encodes the loopback-only PCM audio (see `system_audio.rs`) straight into
+/// the segment's output container, for an audio-only recording (see
+/// `CaptureConfig::capture_video`) that has system audio as its *sole*
+/// source -- no primary ffmpeg process exists at all in that case (see
+/// `CaptureController::begin_segment`), so there's nothing to mux against.
+pub fn build_audio_only_mux_command(loopback_pcm_path: &Path, output_path: &Path) -> Command {
+    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    cmd.arg("-y")
+        .arg("-f")
+        .arg("f32le")
+        .arg("-ar")
+        .arg(system_audio::SAMPLE_RATE.to_string())
+        .arg("-ac")
+        .arg(system_audio::CHANNELS.to_string())
+        .arg("-i")
+        .arg(loopback_pcm_path)
         .arg("-c:a")
         .arg("aac")
         .arg("-b:a")
