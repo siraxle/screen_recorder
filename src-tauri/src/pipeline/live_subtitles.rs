@@ -123,7 +123,7 @@ impl WindowAccumulator {
 }
 
 fn build_live_worker_command(language_override: Option<&str>, device: &str) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::python_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::python_program());
     cmd.arg(python_dir().join("whisper_worker.py"))
         .arg("--live")
         .arg("--model")
@@ -368,7 +368,7 @@ mod tests {
             .join("sample_en.wav");
         assert!(fixture.exists(), "fixture missing at {fixture:?}");
 
-        let decode = Command::new("ffmpeg")
+        let decode = crate::procutil::command("ffmpeg")
             .arg("-y")
             .arg("-i")
             .arg(&fixture)

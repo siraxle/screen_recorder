@@ -129,7 +129,7 @@ pub async fn run_to_completion(mut cmd: Command, label: &str) -> Result<()> {
 /// loopback capture (`system_audio.rs`) runs independently of ffmpeg.
 #[cfg(target_os = "windows")]
 pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y");
 
     if config.capture_video {
@@ -197,7 +197,7 @@ pub fn build_webcam_segment_command(config: &CaptureConfig, output_path: &Path) 
         .device
         .as_deref()
         .expect("webcam.enabled requires a resolved webcam.device");
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y")
         .arg("-thread_queue_size")
         .arg("1024")
@@ -262,7 +262,7 @@ pub fn build_webcam_composite_command(
     has_mic_track: bool,
     output_path: &Path,
 ) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y").arg("-copyts");
     if desktop_offset_secs > 0.0 {
         cmd.arg("-itsoffset").arg(format!("{desktop_offset_secs:.3}"));
@@ -387,7 +387,7 @@ pub fn build_mux_command(
     has_mic_track: bool,
     output_path: &Path,
 ) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y")
         .arg("-i")
         .arg(primary_path)
@@ -434,7 +434,7 @@ pub fn build_mux_command(
 /// source -- no primary ffmpeg process exists at all in that case (see
 /// `CaptureController::begin_segment`), so there's nothing to mux against.
 pub fn build_audio_only_mux_command(loopback_pcm_path: &Path, output_path: &Path) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y")
         .arg("-f")
         .arg("f32le")
@@ -464,7 +464,7 @@ pub fn build_audio_only_mux_command(loopback_pcm_path: &Path, output_path: &Path
 /// Closing stdin makes ffmpeg flush and exit, which is how the caller shuts
 /// the whole live-subtitles pipeline down.
 pub fn build_resample_command() -> Command {
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y")
         .arg("-f")
         .arg("f32le")
@@ -491,7 +491,7 @@ pub fn build_resample_command() -> Command {
 /// Concatenates finalized segments (already muxed with all their audio) into
 /// the final recording, via ffmpeg's concat demuxer with stream copy.
 pub fn build_concat_command(list_file: &Path, output_path: &Path) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y")
         .arg("-f")
         .arg("concat")
@@ -527,7 +527,7 @@ pub fn write_concat_list(segment_paths: &[std::path::PathBuf], list_path: &Path)
 /// takes a plain audio file, so the worker boundary stays swappable instead
 /// of depending on a particular runtime's own container-decoding path.
 pub fn build_wav_extract_command(video_path: &Path, wav_path: &Path) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::ffmpeg_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
     cmd.arg("-y")
         .arg("-i")
         .arg(video_path)
@@ -550,7 +550,7 @@ pub fn build_wav_extract_command(video_path: &Path, wav_path: &Path) -> Command 
 /// controller), so it reflects the real duration of the concatenated output
 /// file. Used to populate the recordings library (F5).
 pub async fn probe_duration_ms(video_path: &Path) -> Result<i64> {
-    let output = Command::new(crate::setup::paths::ffprobe_program())
+    let output = crate::procutil::command(crate::setup::paths::ffprobe_program())
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
@@ -582,7 +582,7 @@ pub async fn probe_duration_ms(video_path: &Path) -> Result<i64> {
 /// picker instead of hardcoding a device name.
 #[cfg(target_os = "windows")]
 pub async fn list_microphones() -> Result<Vec<String>> {
-    let output = Command::new(crate::setup::paths::ffmpeg_program())
+    let output = crate::procutil::command(crate::setup::paths::ffmpeg_program())
         .args(["-hide_banner", "-f", "dshow", "-list_devices", "true", "-i", "dummy"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -619,7 +619,7 @@ pub async fn list_microphones() -> Result<Vec<String>> {
 /// instead of `"(audio)"` in the same `-list_devices` stderr output.
 #[cfg(target_os = "windows")]
 pub async fn list_cameras() -> Result<Vec<String>> {
-    let output = Command::new(crate::setup::paths::ffmpeg_program())
+    let output = crate::procutil::command(crate::setup::paths::ffmpeg_program())
         .args(["-hide_banner", "-f", "dshow", "-list_devices", "true", "-i", "dummy"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -165,7 +165,7 @@ pub fn probe_python_version(candidate: &Path) -> Option<String> {
     if !candidate.is_file() {
         return None;
     }
-    let output = std::process::Command::new(candidate).arg("--version").output().ok()?;
+    let output = crate::procutil::std_command(candidate).arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -193,7 +193,7 @@ pub fn probe_ffmpeg_version(candidate: &Path) -> Option<String> {
     if !candidate.is_file() {
         return None;
     }
-    let output = std::process::Command::new(candidate).arg("-version").output().ok()?;
+    let output = crate::procutil::std_command(candidate).arg("-version").output().ok()?;
     if !output.status.success() {
         return None;
     }

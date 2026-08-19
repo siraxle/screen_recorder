@@ -63,7 +63,7 @@ fn scan_ffmpeg() -> Option<ScannedCandidate> {
 /// OS's PATH search order. Windows-only; see the module doc.
 #[cfg(target_os = "windows")]
 fn where_all(exe_name: &str) -> Vec<PathBuf> {
-    std::process::Command::new("where")
+    crate::procutil::std_command("where")
         .arg(exe_name)
         .output()
         .ok()

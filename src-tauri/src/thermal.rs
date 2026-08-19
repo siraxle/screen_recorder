@@ -54,7 +54,7 @@ pub async fn gpu_present() -> bool {
 }
 
 async fn read_gpu_temp_celsius() -> Option<u32> {
-    let output = tokio::process::Command::new("nvidia-smi")
+    let output = crate::procutil::command("nvidia-smi")
         .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
         .output()
         .await

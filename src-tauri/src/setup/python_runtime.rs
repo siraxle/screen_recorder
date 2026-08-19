@@ -7,7 +7,6 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
 use super::{archive, download, paths, versions, StageProgressFn};
 
@@ -157,7 +156,7 @@ pub async fn install_gpu_packages(app_data_dir: &Path, on_progress: StageProgres
 }
 
 async fn create_venv(interpreter_python: &Path, venv_dir: &Path) -> Result<()> {
-    let status = Command::new(interpreter_python)
+    let status = crate::procutil::command(interpreter_python)
         .arg("-m")
         .arg("venv")
         .arg(venv_dir)
@@ -176,7 +175,7 @@ async fn create_venv(interpreter_python: &Path, venv_dir: &Path) -> Result<()> {
 /// precise percentage.
 async fn run_pip_install(venv_python: &Path, requirements: &Path, on_progress: &StageProgressFn) -> Result<()> {
     let total = count_requirements(requirements).max(1);
-    let mut child = Command::new(venv_python)
+    let mut child = crate::procutil::command(venv_python)
         .arg("-m")
         .arg("pip")
         .arg("install")

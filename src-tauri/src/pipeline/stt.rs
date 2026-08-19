@@ -156,7 +156,7 @@ pub(super) fn python_dir() -> PathBuf {
 }
 
 fn whisper_command(wav_path: &Path, language_override: Option<&str>, device: &str) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::python_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::python_program());
     cmd.arg(python_dir().join("whisper_worker.py"))
         .arg("--audio")
         .arg(wav_path)
@@ -181,7 +181,7 @@ fn whisper_command(wav_path: &Path, language_override: Option<&str>, device: &st
 /// purely a label for the `language` field the worker echoes back, not a
 /// decoding constraint.
 fn parakeet_command(wav_path: &Path, language_override: Option<&str>, device: &str) -> Command {
-    let mut cmd = Command::new(crate::setup::paths::python_program());
+    let mut cmd = crate::procutil::command(crate::setup::paths::python_program());
     cmd.arg(python_dir().join("parakeet_worker.py"))
         .arg("--audio")
         .arg(wav_path)

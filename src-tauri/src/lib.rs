@@ -8,6 +8,7 @@ mod logging;
 mod overlay;
 mod pipeline;
 mod portable;
+mod procutil;
 mod settings_window;
 mod setup;
 mod state;

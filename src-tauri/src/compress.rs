@@ -51,7 +51,7 @@ fn handbrake_cli_path(app: &AppHandle) -> Result<PathBuf> {
 /// which maximizes output resolution up to the source rather than forcing a
 /// specific width/height), H.264/x264 at quality 27, 128kbit/s AAC audio.
 fn build_command(handbrake_cli: &Path, input: &Path, output: &Path) -> Command {
-    let mut cmd = Command::new(handbrake_cli);
+    let mut cmd = crate::procutil::command(handbrake_cli);
     cmd.arg("-i")
         .arg(input)
         .arg("-o")
