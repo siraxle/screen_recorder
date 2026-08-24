@@ -110,7 +110,13 @@ fn resolve_device_from(pref: DeviceSetting, gpu_present: bool, gpu_packages_read
 }
 
 pub(super) async fn resolve_device(pref: DeviceSetting) -> &'static str {
-    resolve_device_from(pref, crate::thermal::gpu_present().await, crate::setup::paths::gpu_packages_ready())
+    let gpu_present = crate::thermal::gpu_present().await;
+    let gpu_packages_ready = crate::setup::paths::gpu_packages_ready();
+    let device = resolve_device_from(pref, gpu_present, gpu_packages_ready);
+    tracing::info!(
+        "stt device resolved to {device} (pref={pref:?}, gpu_present={gpu_present}, gpu_packages_ready={gpu_packages_ready})"
+    );
+    device
 }
 
 /// CTranslate2 has no float16 CPU kernel; `int8` is its recommended

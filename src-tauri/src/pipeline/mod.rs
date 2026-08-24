@@ -224,6 +224,8 @@ async fn process_job(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> R
         _ => PipelineStatus::Transcribing,
     };
 
+    tracing::info!("job {} ({}) starting for recording {recording_id}", job.id, job.stage);
+
     {
         let job_id = job.id.clone();
         db::with_db(db, move |conn| db::set_job_running(conn, &job_id)).await?;
@@ -258,6 +260,7 @@ async fn process_job(db: &SharedConn, app_handle: &AppHandle, job_id: &str) -> R
 
     match result {
         Ok(()) => {
+            tracing::info!("job {} ({}) completed for recording {recording_id}", job.id, job.stage);
             let job_id = job.id.clone();
             db::with_db(db, move |conn| db::set_job_done(conn, &job_id)).await?;
         }
@@ -460,6 +463,8 @@ async fn process_translate_job(
     app_handle: &AppHandle,
     job: &db::JobRow,
 ) -> Result<()> {
+    tracing::info!("job {} (translate) starting for recording {}", job.id, job.recording_id);
+
     {
         let job_id = job.id.clone();
         db::with_db(db, move |conn| db::set_job_running(conn, &job_id)).await?;
@@ -517,6 +522,10 @@ async fn process_translate_job(
             }
         }
         Ok(o) => {
+            tracing::info!(
+                "job {} (translate) completed for recording {recording_id} ({}/{} segments failed)",
+                job.id, o.failed_segments, o.total_segments
+            );
             let job_id = job.id.clone();
             db::with_db(db, move |conn| db::set_job_done(conn, &job_id)).await?;
             TranslationUpdate {
