@@ -37,8 +37,8 @@ $ErrorActionPreference = "Stop"
 # this is the same pinned static build the installed app downloads on first
 # run; re-pinning one without the other means the portable build and the
 # installed build ship different ffmpeg versions.
-$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-8.1.zip"
-$FfmpegSha256 = "dee1b458ad8fa8556d0cc7287a1ec66664d0c2d6a1098d19cf0c465d9d8430bf"
+$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-23-13-03/ffmpeg-n8.1.2-44-g7c533d0f86-win64-gpl-8.1.zip"
+$FfmpegSha256 = "40d98aef3e8d48665c4dbbdd0093d6e50c61d71a3a48067e9d3edd9fb3a1f3ca"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $SrcTauri = Join-Path $RepoRoot "src-tauri"

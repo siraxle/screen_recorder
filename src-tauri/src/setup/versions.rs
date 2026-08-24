@@ -20,8 +20,8 @@ pub const PYTHON_APPROX_DOWNLOAD_BYTES: u64 = 46_113_914;
 /// tag. BtbN doesn't publish per-file checksums, so this hash was computed
 /// by downloading the asset directly from the pinned URL below. See
 /// https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-09-13-03
-pub const FFMPEG_URL: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-8.1.zip";
-pub const FFMPEG_SHA256: &str = "dee1b458ad8fa8556d0cc7287a1ec66664d0c2d6a1098d19cf0c465d9d8430bf";
+pub const FFMPEG_URL: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-23-13-03/ffmpeg-n8.1.2-44-g7c533d0f86-win64-gpl-8.1.zip";
+pub const FFMPEG_SHA256: &str = "40d98aef3e8d48665c4dbbdd0093d6e50c61d71a3a48067e9d3edd9fb3a1f3ca";
 pub const FFMPEG_APPROX_DOWNLOAD_BYTES: u64 = 167_989_881;
 
 /// Rough installed-size estimates (download + unpacked pip packages) used
