@@ -5,6 +5,7 @@ import App from "./App";
 import AnnotationCanvas from "./annotation/AnnotationCanvas";
 import AnnotationToolbar from "./annotation/AnnotationToolbar";
 import SettingsWindow from "./settings/SettingsWindow";
+import LiveSubtitlesWindow from "./live_subtitles/LiveSubtitlesWindow";
 import { ErrorBoundary } from "./ErrorBoundary";
 
 function RootForWindow() {
@@ -15,6 +16,8 @@ function RootForWindow() {
       return <AnnotationToolbar />;
     case "settings":
       return <SettingsWindow />;
+    case "live-subtitles":
+      return <LiveSubtitlesWindow />;
     default:
       return <App />;
   }

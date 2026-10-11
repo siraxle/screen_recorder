@@ -3,6 +3,7 @@ mod commands;
 mod compress;
 mod db;
 mod hotkeys;
+mod live_subtitles_window;
 mod llm;
 mod logging;
 mod overlay;
@@ -96,6 +97,7 @@ pub fn run() {
             app.manage(AppState {
                 controller: tokio::sync::Mutex::new(None),
                 live_subtitles: tokio::sync::Mutex::new(None),
+                live_caption_history: tokio::sync::Mutex::new(Vec::new()),
                 recordings_dir: tokio::sync::Mutex::new(recordings_dir),
                 db,
                 job_tx,
@@ -156,6 +158,8 @@ pub fn run() {
             commands::set_stt_settings,
             commands::get_live_subtitle_settings,
             commands::set_live_subtitle_settings,
+            commands::get_live_subtitle_history,
+            commands::open_live_subtitles_window,
             commands::show_annotation_overlay,
             commands::hide_annotation_overlay,
             commands::get_hotkey_settings,

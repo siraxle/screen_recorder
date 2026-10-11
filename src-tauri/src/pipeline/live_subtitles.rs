@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 
 use crate::capture::ffmpeg;
 use crate::db;
+use crate::state::AppState;
 
 use super::stt::{self, python_dir, DeviceSetting, DEFAULT_MODEL};
 
@@ -237,6 +238,18 @@ impl LiveSubtitles {
                         if let Ok(LiveWorkerMessage::Caption { text }) =
                             serde_json::from_str::<LiveWorkerMessage>(&line)
                         {
+                            // Empty text is a "clear the caption" signal (see
+                            // whisper_worker.py --live's module doc), not a
+                            // real line -- only real lines join the history
+                            // the live-subtitles window backfills from.
+                            if !text.is_empty() {
+                                caption_app_handle
+                                    .state::<AppState>()
+                                    .live_caption_history
+                                    .lock()
+                                    .await
+                                    .push(text.clone());
+                            }
                             let _ = caption_app_handle
                                 .emit("live-subtitle-caption", LiveSubtitleCaption { text });
                         }

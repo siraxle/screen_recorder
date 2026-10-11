@@ -20,6 +20,14 @@ pub struct AppState {
     /// current recording, if the feature is enabled and system audio
     /// capture is on. Same one-at-a-time shape as `controller`.
     pub live_subtitles: Mutex<Option<LiveSubtitles>>,
+    /// Every non-empty caption emitted over `live-subtitle-caption` so far
+    /// this recording session, in order -- lets the live-subtitles window
+    /// (`live_subtitles_window.rs`) backfill history for captions it missed
+    /// while closed, since the event itself carries no history of its own.
+    /// Cleared at the start of each new recording (`commands::start_recording`);
+    /// deliberately left populated after `stop_recording` so the window can
+    /// still be reviewed right after a session ends.
+    pub live_caption_history: Mutex<Vec<String>>,
     /// Base folder new recordings are saved under; each recording gets its
     /// own subfolder within it (see `commands::stop_recording`). User-
     /// changeable at runtime via `commands::set_recordings_dir`, so it's

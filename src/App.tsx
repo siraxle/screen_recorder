@@ -857,6 +857,10 @@ function App() {
     }
   }
 
+  async function handleOpenLiveSubtitlesWindow() {
+    await run(() => invoke("open_live_subtitles_window"));
+  }
+
   async function handleToggleAnnotationOverlay() {
     const nextVisible = !annotationOverlayVisible;
     await run(() => invoke(nextVisible ? "show_annotation_overlay" : "hide_annotation_overlay"));
@@ -1419,6 +1423,9 @@ function App() {
           {liveSubtitlesCooldown && (
             <p className="warning">GPU cooling down — live captions paused.</p>
           )}
+          <button disabled={busy} onClick={handleOpenLiveSubtitlesWindow}>
+            Open live subtitles in a separate window
+          </button>
         </section>
       )}
 

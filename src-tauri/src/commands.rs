@@ -8,6 +8,7 @@ use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
 use crate::compress;
 use crate::db::{self, RecordingSummary, Segment, Summary};
 use crate::hotkeys::{self, HotkeySettings};
+use crate::live_subtitles_window;
 use crate::llm::{self, LlmSettings, ProviderKind};
 use crate::logging::{self, log_err};
 use crate::overlay;
@@ -49,6 +50,14 @@ pub async fn start_recording(
     if guard.is_some() {
         return Err("a recording is already in progress".to_string());
     }
+
+    // Fresh session, fresh history -- see `AppState::live_caption_history`'s
+    // doc comment. Cleared unconditionally (not just when live subtitles end
+    // up enabled below) so a stale previous session's lines can never leak
+    // into a live-subtitles window opened during this one; the event lets an
+    // already-open window drop its own in-memory copy in step.
+    state.live_caption_history.lock().await.clear();
+    let _ = app.emit("live-subtitle-history-cleared", ());
 
     // F6 live subtitles: only wired up when the setting is on *and* system
     // audio capture is enabled this session (system audio is the only tap
@@ -876,6 +885,23 @@ pub async fn set_live_subtitle_settings(
     })
     .await
     .map_err(log_err)
+}
+
+/// Every caption emitted this recording session so far -- lets the
+/// live-subtitles window backfill on open (or reopen) instead of only
+/// showing captions emitted after it started listening. See
+/// `AppState::live_caption_history`.
+#[tauri::command]
+pub async fn get_live_subtitle_history(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state.live_caption_history.lock().await.clone())
+}
+
+/// Opens (or refocuses) the live-subtitles window -- a scrollable caption
+/// history, as opposed to the main window's single-line preview. See
+/// `live_subtitles_window::show`.
+#[tauri::command]
+pub async fn open_live_subtitles_window(app: tauri::AppHandle) -> Result<(), String> {
+    live_subtitles_window::show(&app).map_err(log_err)
 }
 
 /// Cheap, read-only dependency status (see `setup::check_all`) -- safe to
