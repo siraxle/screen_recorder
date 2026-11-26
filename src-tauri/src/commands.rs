@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::capture::config::MonitorRegion;
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
 use crate::compress;
 use crate::db::{self, RecordingSummary, Segment, Summary};
@@ -16,6 +17,7 @@ use crate::pipeline::live_subtitles::{self, LiveSubtitles, LiveSubtitlesSettings
 use crate::pipeline::stt::{self, SttSettings};
 use crate::settings_window;
 use crate::state::AppState;
+use crate::recording_files;
 use crate::subtitle;
 
 #[tauri::command]
@@ -27,6 +29,78 @@ pub async fn list_microphones() -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn list_cameras() -> Result<Vec<String>, String> {
     ffmpeg::list_cameras().await.map_err(log_err)
+}
+
+/// One entry of the monitor picker (see `list_monitors`). Position/size are
+/// physical pixels in the virtual desktop -- the space gdigrab crops in.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorInfo {
+    pub name: String,
+    pub primary: bool,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f64,
+}
+
+fn current_monitors(app: &tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
+    let primary_name = app
+        .primary_monitor()
+        .map_err(log_err)?
+        .and_then(|m| m.name().cloned());
+    let monitors = app.available_monitors().map_err(log_err)?;
+    Ok(monitors
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let name = m.name().cloned().unwrap_or_else(|| format!("Monitor {}", i + 1));
+            MonitorInfo {
+                primary: primary_name.as_deref() == Some(name.as_str()),
+                name,
+                x: m.position().x,
+                y: m.position().y,
+                width: m.size().width,
+                height: m.size().height,
+                scale_factor: m.scale_factor(),
+            }
+        })
+        .collect())
+}
+
+/// Monitor picker: lets the user record one specific monitor instead of the
+/// whole multi-monitor virtual desktop.
+#[tauri::command]
+pub async fn list_monitors(app: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
+    current_monitors(&app)
+}
+
+/// Resolves `CaptureConfig::monitor` (a monitor name) to the monitor's
+/// current rectangle. Looked up at start time rather than trusting
+/// coordinates from the frontend, so a layout change between opening the
+/// picker and pressing Record can't crop the wrong area. A monitor that's
+/// gone (unplugged) fails the start instead of silently recording all
+/// screens.
+fn resolve_monitor_region(app: &tauri::AppHandle, capture: &mut CaptureConfig) -> Result<(), String> {
+    capture.monitor_region = None;
+    if !capture.capture_video {
+        return Ok(());
+    }
+    let Some(name) = capture.monitor.as_deref() else {
+        return Ok(());
+    };
+    let monitor = current_monitors(app)?
+        .into_iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| format!("selected monitor \"{name}\" is no longer connected"))?;
+    capture.monitor_region = Some(MonitorRegion {
+        x: monitor.x,
+        y: monitor.y,
+        width: monitor.width,
+        height: monitor.height,
+    });
+    Ok(())
 }
 
 /// `start_recording`'s input: capture source selection plus the
@@ -66,7 +140,11 @@ pub async fn start_recording(
     let live_settings = db::with_db(&state.db, |conn| live_subtitles::load_settings(conn))
         .await
         .map_err(log_err)?;
-    let live_tap = if live_settings.enabled && settings.capture.capture_system_audio {
+    // Normalized first so F17 camera-only mode (which never captures system
+    // audio) can't start a live-subtitles pipeline with no audio to feed it.
+    let mut capture = settings.capture.normalized();
+    resolve_monitor_region(&app, &mut capture)?;
+    let live_tap = if live_settings.enabled && capture.capture_system_audio {
         let stt_device = db::with_db(&state.db, |conn| stt::load_settings(conn))
             .await
             .map_err(log_err)?
@@ -87,7 +165,7 @@ pub async fn start_recording(
 
     let recordings_dir = state.recordings_dir.lock().await.clone();
     let mut controller = CaptureController::new(
-        settings.capture,
+        capture,
         &recordings_dir,
         settings.language_override,
         live_tap,
@@ -376,23 +454,68 @@ pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<Recording
 /// Empty/whitespace-only titles are normalized to `None` so clearing the
 /// rename field falls back to the UI's default display (formatted date)
 /// instead of persisting an empty string.
+///
+/// A non-empty title also renames the recording's folder and files on disk
+/// (see `recording_files`), so the recordings folder matches the app.
+/// Clearing the title leaves the on-disk names as they are. Returns the
+/// updated recording, since its `videoPath` may have changed.
 #[tauri::command]
 pub async fn rename_recording(
     state: State<'_, AppState>,
     recording_id: String,
     title: Option<String>,
-) -> Result<(), String> {
+) -> Result<db::RecordingSummary, String> {
     let title = title.and_then(|t| {
         let trimmed = t.trim().to_string();
         if trimmed.is_empty() { None } else { Some(trimmed) }
     });
-    db::with_db(&state.db, move |conn| {
-        db::set_recording_title(conn, &recording_id, title.as_deref())
+    let file_name = title.as_deref().and_then(recording_files::sanitize_file_name);
+    let recordings_dir = state.recordings_dir.lock().await.clone();
+
+    // Held for the whole rename so a compression can't start reading the
+    // old path in between the check and the move.
+    let compressing = state.compressing.lock().await;
+    if file_name.is_some() && compressing.contains(&recording_id) {
+        return Err("Cannot rename while this recording is being compressed — try again when it finishes.".to_string());
+    }
+
+    let summary = db::with_db(&state.db, move |conn| {
+        let mut renamed = None;
+        if let Some(name) = &file_name {
+            if db::has_active_transcribe_job(conn, &recording_id)? {
+                anyhow::bail!("Cannot rename while this recording is being transcribed — try again when it finishes.");
+            }
+            let video_path = db::get_recording_video_path(conn, &recording_id)?;
+            let compressed_path = db::get_recording_compressed_path(conn, &recording_id)?;
+            renamed = Some(recording_files::rename_recording_files(
+                &video_path,
+                compressed_path.as_deref(),
+                name,
+                &recordings_dir,
+            )?);
+        }
+        let persisted = (|| {
+            let tx = conn.unchecked_transaction()?;
+            db::set_recording_title(&tx, &recording_id, title.as_deref())?;
+            if let Some(r) = &renamed {
+                db::set_recording_paths(&tx, &recording_id, &r.video_path, r.compressed_path.as_deref())?;
+            }
+            tx.commit()?;
+            anyhow::Ok(())
+        })();
+        if let Err(e) = persisted {
+            if let Some(r) = renamed {
+                r.rollback();
+            }
+            return Err(e);
+        }
+        db::get_recording_summary(conn, &recording_id)
     })
     .await
     .map_err(log_err)?;
+    drop(compressing);
     tracing::info!("recording renamed");
-    Ok(())
+    Ok(summary)
 }
 
 #[tauri::command]

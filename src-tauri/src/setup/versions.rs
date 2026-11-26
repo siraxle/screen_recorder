@@ -15,14 +15,15 @@ pub const PYTHON_SHA256: &str = "6cf2be701aa7e9470454c9c86285c1bcc1832518d63e39c
 /// the disk-space check's margin -- not required to be exact.
 pub const PYTHON_APPROX_DOWNLOAD_BYTES: u64 = 46_113_914;
 
-/// BtbN/FFmpeg-Builds, a static (non-shared) GPL Windows x86_64 build,
+/// FFmpeg-Builds/FFmpeg-Builds (formerly BtbN/FFmpeg-Builds), a static (non-shared) GPL Windows x86_64 build,
 /// pinned to one dated autobuild release rather than the rolling `latest`
-/// tag. BtbN doesn't publish per-file checksums, so this hash was computed
-/// by downloading the asset directly from the pinned URL below. See
-/// https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-09-13-03
-pub const FFMPEG_URL: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-23-13-03/ffmpeg-n8.1.2-44-g7c533d0f86-win64-gpl-8.1.zip";
-pub const FFMPEG_SHA256: &str = "40d98aef3e8d48665c4dbbdd0093d6e50c61d71a3a48067e9d3edd9fb3a1f3ca";
-pub const FFMPEG_APPROX_DOWNLOAD_BYTES: u64 = 167_989_881;
+/// tag. The hash below matches the asset digest GitHub reports and was
+/// re-verified by downloading the asset from the pinned URL. Old autobuild
+/// releases get pruned, so this pin must be bumped when it starts 404ing. See
+/// https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/tag/autobuild-2026-11-22-12-36
+pub const FFMPEG_URL: &str = "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-22-12-36/ffmpeg-n8.1.3-39-g660b5aa7db-win64-gpl-8.1.zip";
+pub const FFMPEG_SHA256: &str = "b16431997ec2685c1baab7dc214537cdbdd48dabdd6e233d4ab0f1e316de0dc7";
+pub const FFMPEG_APPROX_DOWNLOAD_BYTES: u64 = 197_396_631;
 
 /// Rough installed-size estimates (download + unpacked pip packages) used
 /// only for the UI's "here's what will be downloaded" disclosure and the

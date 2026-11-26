@@ -5,6 +5,13 @@
 
 faster-whisper>=1.2
 
+# faster-whisper (<=1.2.1) calls av.open(..., metadata_errors="ignore"), a
+# kwarg PyAV 19 removed -- with av 19 every transcription dies with
+# "TypeError: open() got an unexpected keyword argument 'metadata_errors'".
+# faster-whisper only declares av>=11, so cap it here until a faster-whisper
+# release stops passing that kwarg.
+av>=11,<19
+
 # NVIDIA Parakeet-TDT-0.6B-v3 (see parakeet_worker.py), run through ONNX
 # Runtime instead of NeMo. `hub` enables the automatic Hugging Face download
 # `onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3")` does on first use (same

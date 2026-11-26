@@ -143,6 +143,19 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
             // processes correctly.
             cmd.arg("-use_wallclock_as_timestamps").arg("1");
         }
+        if let Some(region) = config.monitor_region {
+            // Restricts the grab to one monitor. gdigrab interprets these in
+            // physical virtual-desktop pixels (verified on a mixed 125%/100%
+            // DPI dual-monitor setup), which is what `MonitorRegion` holds.
+            // Size is rounded down to even: libx264 + yuv420p rejects odd
+            // frame dimensions.
+            cmd.arg("-offset_x")
+                .arg(region.x.to_string())
+                .arg("-offset_y")
+                .arg(region.y.to_string())
+                .arg("-video_size")
+                .arg(format!("{}x{}", region.width & !1, region.height & !1));
+        }
         cmd.arg("-framerate")
             .arg(config.framerate.to_string())
             .arg("-i")
@@ -216,6 +229,67 @@ pub fn build_webcam_segment_command(config: &CaptureConfig, output_path: &Path) 
         .arg("-pix_fmt")
         .arg("yuv420p")
         .arg("-movflags")
+        .arg("+frag_keyframe+empty_moov")
+        .arg(output_path);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Builds the F17 camera-only capture process: the camera full-frame (no
+/// desktop), plus the microphone if enabled, recorded in one process.
+///
+/// Camera and microphone share a single dshow input (`video=..:audio=..`)
+/// rather than two inputs or two processes, so dshow delivers both streams
+/// against the same clock and they stay in sync without the offset
+/// bookkeeping F16's separate-process overlay needs.
+///
+/// Neither `-framerate` nor `-video_size` is passed: the camera records in
+/// its native (dshow default) mode, as F17 specifies, instead of being
+/// forced into a mode it may not support. `hflip` mirrors the picture so the
+/// saved video looks the way the user sees themselves; it's a trivial
+/// per-frame copy, cheap enough to run live. `-rtbufsize` gives dshow room
+/// to absorb encoder hiccups at camera resolutions instead of dropping
+/// frames with "real-time buffer full".
+#[cfg(target_os = "windows")]
+pub fn build_camera_only_segment_command(config: &CaptureConfig, output_path: &Path) -> Command {
+    let camera = config
+        .camera_only
+        .device
+        .as_deref()
+        .expect("camera_only.enabled requires a resolved camera_only.device");
+    let mut input = format!("video={camera}");
+    if config.capture_microphone {
+        let mic = config
+            .microphone_device
+            .as_deref()
+            .expect("capture_microphone requires a resolved microphone_device");
+        input.push_str(&format!(":audio={mic}"));
+    }
+
+    let mut cmd = crate::procutil::command(crate::setup::paths::ffmpeg_program());
+    cmd.arg("-y")
+        .arg("-thread_queue_size")
+        .arg("1024")
+        .arg("-rtbufsize")
+        .arg("256M")
+        .arg("-f")
+        .arg("dshow")
+        .arg("-i")
+        .arg(input)
+        .arg("-vf")
+        .arg("hflip")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("ultrafast")
+        .arg("-pix_fmt")
+        .arg("yuv420p");
+    if config.capture_microphone {
+        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k");
+    }
+    cmd.arg("-movflags")
         .arg("+frag_keyframe+empty_moov")
         .arg(output_path);
     cmd.stdin(Stdio::piped())
@@ -356,6 +430,13 @@ pub fn build_segment_command(_config: &CaptureConfig, _output_path: &Path) -> Co
 pub fn build_webcam_segment_command(_config: &CaptureConfig, _output_path: &Path) -> Command {
     unimplemented!(
         "screen capture is only implemented for Windows in this prototype (Week 1 milestone scope, see roadmap in screen-recorder-spec.md)"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn build_camera_only_segment_command(_config: &CaptureConfig, _output_path: &Path) -> Command {
+    unimplemented!(
+        "camera capture is only implemented for Windows in this prototype (Week 1 milestone scope, see roadmap in screen-recorder-spec.md)"
     )
 }
 
@@ -646,4 +727,122 @@ pub async fn list_cameras() -> Result<Vec<String>> {
 #[cfg(not(target_os = "windows"))]
 pub async fn list_cameras() -> Result<Vec<String>> {
     Ok(Vec::new())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use super::super::config::CameraOnlyConfig;
+
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn camera_only_config(mic: Option<&str>) -> CaptureConfig {
+        CaptureConfig {
+            capture_microphone: mic.is_some(),
+            microphone_device: mic.map(str::to_string),
+            camera_only: CameraOnlyConfig {
+                enabled: true,
+                device: Some("Test Cam".to_string()),
+            },
+            ..CaptureConfig::default()
+        }
+        .normalized()
+    }
+
+    /// F17: the camera is recorded full-frame in its native mode (no forced
+    /// framerate/size), mirrored, with no desktop capture at all.
+    #[test]
+    fn camera_only_command_records_mirrored_camera_in_native_mode_without_screen() {
+        let config = camera_only_config(None);
+        let a = args(&build_camera_only_segment_command(&config, Path::new("out.mp4")));
+
+        assert!(a.windows(2).any(|w| w == ["-i", "video=Test Cam"]), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-vf", "hflip"]), "{a:?}");
+        assert!(!a.iter().any(|x| x == "gdigrab" || x == "desktop"), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-framerate" || x == "-video_size"), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-c:a"), "no audio codec without a mic: {a:?}");
+    }
+
+    /// F17: the microphone shares the camera's dshow input so both streams
+    /// are delivered against one clock.
+    #[test]
+    fn camera_only_command_includes_microphone_in_same_input() {
+        let config = camera_only_config(Some("Test Mic"));
+        let a = args(&build_camera_only_segment_command(&config, Path::new("out.mp4")));
+
+        assert!(
+            a.windows(2).any(|w| w == ["-i", "video=Test Cam:audio=Test Mic"]),
+            "{a:?}"
+        );
+        assert!(a.windows(2).any(|w| w == ["-c:a", "aac"]), "{a:?}");
+    }
+
+    /// F17: camera-only mode never captures the screen, the webcam overlay,
+    /// or system audio, regardless of what the caller sent.
+    #[test]
+    fn normalized_camera_only_drops_screen_overlay_and_system_audio() {
+        let mut config = CaptureConfig::default();
+        config.webcam.enabled = true;
+        config.camera_only.enabled = true;
+        let config = config.normalized();
+
+        assert!(!config.capture_video);
+        assert!(!config.capture_system_audio);
+        assert!(!config.webcam.enabled);
+        assert!(config.capture_microphone, "microphone stays as the user set it");
+    }
+
+    /// Monitor selection: with no monitor chosen, the whole virtual desktop
+    /// (every monitor) is grabbed, exactly as before the feature existed.
+    #[test]
+    fn segment_command_without_monitor_grabs_whole_desktop() {
+        let config = CaptureConfig {
+            capture_microphone: false,
+            ..CaptureConfig::default()
+        };
+        let a = args(&build_segment_command(&config, Path::new("out.mp4")));
+
+        assert!(a.windows(2).any(|w| w == ["-i", "desktop"]), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-offset_x" || x == "-video_size"), "{a:?}");
+    }
+
+    /// Monitor selection: a chosen monitor crops gdigrab to exactly that
+    /// monitor's rectangle, including negative offsets (monitor left of the
+    /// primary) and odd sizes rounded down to even for yuv420p.
+    #[test]
+    fn segment_command_with_monitor_crops_to_that_monitor() {
+        let config = CaptureConfig {
+            monitor: Some(r"\\.\DISPLAY2".to_string()),
+            monitor_region: Some(super::super::config::MonitorRegion {
+                x: -1921,
+                y: 0,
+                width: 1921,
+                height: 1081,
+            }),
+            capture_microphone: false,
+            ..CaptureConfig::default()
+        };
+        let a = args(&build_segment_command(&config, Path::new("out.mp4")));
+
+        assert!(a.windows(2).any(|w| w == ["-offset_x", "-1921"]), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-offset_y", "0"]), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-video_size", "1920x1080"]), "{a:?}");
+        let offset_pos = a.iter().position(|x| x == "-offset_x").unwrap();
+        let input_pos = a.iter().position(|x| x == "desktop").unwrap();
+        assert!(offset_pos < input_pos, "crop options must precede -i: {a:?}");
+    }
+
+    /// F17 "not enabled" criterion: a plain config is left untouched.
+    #[test]
+    fn normalized_without_camera_only_is_unchanged() {
+        let config = CaptureConfig::default().normalized();
+        assert!(config.capture_video);
+        assert!(config.capture_system_audio);
+        assert!(!config.camera_only.enabled);
+    }
 }

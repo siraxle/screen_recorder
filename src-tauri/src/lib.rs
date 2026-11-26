@@ -8,6 +8,7 @@ mod llm;
 mod logging;
 mod overlay;
 mod pipeline;
+mod recording_files;
 mod portable;
 mod procutil;
 mod settings_window;
@@ -126,6 +127,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_microphones,
             commands::list_cameras,
+            commands::list_monitors,
             commands::start_recording,
             commands::pause_recording,
             commands::resume_recording,
