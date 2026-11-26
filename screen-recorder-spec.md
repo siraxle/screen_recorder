@@ -215,6 +215,18 @@ Core principle: **Capture → Transcribe → Summarize → Index** — an asynch
   When the user clicks "Stop"
   Then the recording file is saved to disk in a readable format (mp4), and the recording appears in the library with status "Awaiting processing."
 
+- Given more than one monitor is connected and the user selected one specific monitor in the monitor picker
+  When they record the screen (with or without the webcam overlay)
+  Then the saved video contains only that monitor, at its native resolution, and the webcam overlay (if enabled) is placed in the chosen corner of that monitor.
+
+- Given more than one monitor is connected and the user selected "All monitors" (the default)
+  When they record the screen
+  Then the saved video contains every monitor side by side, exactly as before monitor selection existed.
+
+- Given the user selected a specific monitor and that monitor is disconnected before recording starts
+  When they click "Start Recording"
+  Then the app shows a clear error and does not start recording (it never silently falls back to recording all monitors).
+
 **F2. Local transcription**
 - Given a recording is saved and a Whisper worker is available locally
   When the automatic pipeline starts transcription

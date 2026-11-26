@@ -46,7 +46,24 @@ interface CaptureConfig {
   captureVideo: boolean;
   webcam: WebcamOverlayConfig;
   cameraOnly: CameraOnlyConfig;
+  // Monitor to record by OS name; null records all monitors at once.
+  monitor: string | null;
 }
+
+// One entry of the monitor picker (see commands::list_monitors). Physical
+// pixels in the virtual desktop.
+interface MonitorInfo {
+  name: string;
+  primary: boolean;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scaleFactor: number;
+}
+
+// Sentinel <select> value for "record every monitor".
+const ALL_MONITORS = "__all__";
 
 // F17: record the camera full-frame instead of the screen. Microphone is the
 // only audio source in this mode; the backend ignores screen, overlay and
@@ -320,6 +337,8 @@ function App() {
   const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("bottom_right");
   const [cameraOnly, setCameraOnly] = useState(false);
   const [cameraOnlyDevice, setCameraOnlyDevice] = useState<string>("");
+  const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
+  const [selectedMonitor, setSelectedMonitor] = useState<string>(ALL_MONITORS);
   const [languageOverride, setLanguageOverride] = useState<string>("");
   const [customLanguage, setCustomLanguage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
@@ -370,6 +389,12 @@ function App() {
         setMicrophones(devices);
         if (devices.length > 0) setMicrophoneDevice(devices[0]);
       })
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    invoke<MonitorInfo[]>("list_monitors")
+      .then(setMonitors)
       .catch((e) => setError(String(e)));
   }, []);
 
@@ -816,6 +841,7 @@ function App() {
         enabled: cameraOnly,
         device: cameraOnly && cameraOnlyDevice ? cameraOnlyDevice : null,
       },
+      monitor: screenVideo && selectedMonitor !== ALL_MONITORS ? selectedMonitor : null,
     };
     await run(() =>
       invoke("start_recording", {
@@ -1264,6 +1290,21 @@ function App() {
           />
           Record video
         </label>
+        {screenVideo && monitors.length > 1 && (
+          <select
+            value={selectedMonitor}
+            disabled={status !== "stopped"}
+            onChange={(e) => setSelectedMonitor(e.currentTarget.value)}
+          >
+            <option value={ALL_MONITORS}>All monitors</option>
+            {monitors.map((m, i) => (
+              <option key={m.name} value={m.name}>
+                Monitor {i + 1}
+                {m.primary ? " (primary)" : ""} — {m.width}×{m.height}
+              </option>
+            ))}
+          </select>
+        )}
         {!captureVideo && !cameraOnly && (
           <p className="output">
             Audio-only recording — only the audio sources selected below will be captured.

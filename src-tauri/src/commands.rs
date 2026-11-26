@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::capture::config::MonitorRegion;
 use crate::capture::{ffmpeg, CaptureConfig, CaptureController, RecordingStatus};
 use crate::compress;
 use crate::db::{self, RecordingSummary, Segment, Summary};
@@ -27,6 +28,78 @@ pub async fn list_microphones() -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn list_cameras() -> Result<Vec<String>, String> {
     ffmpeg::list_cameras().await.map_err(log_err)
+}
+
+/// One entry of the monitor picker (see `list_monitors`). Position/size are
+/// physical pixels in the virtual desktop -- the space gdigrab crops in.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorInfo {
+    pub name: String,
+    pub primary: bool,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f64,
+}
+
+fn current_monitors(app: &tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
+    let primary_name = app
+        .primary_monitor()
+        .map_err(log_err)?
+        .and_then(|m| m.name().cloned());
+    let monitors = app.available_monitors().map_err(log_err)?;
+    Ok(monitors
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let name = m.name().cloned().unwrap_or_else(|| format!("Monitor {}", i + 1));
+            MonitorInfo {
+                primary: primary_name.as_deref() == Some(name.as_str()),
+                name,
+                x: m.position().x,
+                y: m.position().y,
+                width: m.size().width,
+                height: m.size().height,
+                scale_factor: m.scale_factor(),
+            }
+        })
+        .collect())
+}
+
+/// Monitor picker: lets the user record one specific monitor instead of the
+/// whole multi-monitor virtual desktop.
+#[tauri::command]
+pub async fn list_monitors(app: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
+    current_monitors(&app)
+}
+
+/// Resolves `CaptureConfig::monitor` (a monitor name) to the monitor's
+/// current rectangle. Looked up at start time rather than trusting
+/// coordinates from the frontend, so a layout change between opening the
+/// picker and pressing Record can't crop the wrong area. A monitor that's
+/// gone (unplugged) fails the start instead of silently recording all
+/// screens.
+fn resolve_monitor_region(app: &tauri::AppHandle, capture: &mut CaptureConfig) -> Result<(), String> {
+    capture.monitor_region = None;
+    if !capture.capture_video {
+        return Ok(());
+    }
+    let Some(name) = capture.monitor.as_deref() else {
+        return Ok(());
+    };
+    let monitor = current_monitors(app)?
+        .into_iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| format!("selected monitor \"{name}\" is no longer connected"))?;
+    capture.monitor_region = Some(MonitorRegion {
+        x: monitor.x,
+        y: monitor.y,
+        width: monitor.width,
+        height: monitor.height,
+    });
+    Ok(())
 }
 
 /// `start_recording`'s input: capture source selection plus the
@@ -68,7 +141,8 @@ pub async fn start_recording(
         .map_err(log_err)?;
     // Normalized first so F17 camera-only mode (which never captures system
     // audio) can't start a live-subtitles pipeline with no audio to feed it.
-    let capture = settings.capture.normalized();
+    let mut capture = settings.capture.normalized();
+    resolve_monitor_region(&app, &mut capture)?;
     let live_tap = if live_settings.enabled && capture.capture_system_audio {
         let stt_device = db::with_db(&state.db, |conn| stt::load_settings(conn))
             .await

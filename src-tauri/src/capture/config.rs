@@ -35,6 +35,30 @@ pub struct CaptureConfig {
     /// `CaptureConfig::normalized`.
     #[serde(default)]
     pub camera_only: CameraOnlyConfig,
+    /// Which monitor to record, by OS monitor name (e.g. `\\.\DISPLAY1`, as
+    /// returned by `commands::list_monitors`). `None` records every monitor
+    /// at once (the whole virtual desktop), which is the pre-existing
+    /// behavior. Resolved to `monitor_region` by `commands::start_recording`
+    /// before the controller ever sees it.
+    #[serde(default)]
+    pub monitor: Option<String>,
+    /// The selected monitor's rectangle in physical virtual-desktop pixels,
+    /// resolved from `monitor` at recording start (never sent by the
+    /// frontend). `None` = capture the whole virtual desktop.
+    #[serde(skip)]
+    pub monitor_region: Option<MonitorRegion>,
+}
+
+/// A monitor's rectangle in physical pixels within the virtual desktop --
+/// the coordinate space gdigrab's `-offset_x`/`-offset_y` use. `x`/`y` can be
+/// negative for monitors left of / above the primary one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 fn default_capture_video() -> bool {
@@ -51,6 +75,8 @@ impl Default for CaptureConfig {
             capture_video: true,
             webcam: WebcamOverlayConfig::default(),
             camera_only: CameraOnlyConfig::default(),
+            monitor: None,
+            monitor_region: None,
         }
     }
 }

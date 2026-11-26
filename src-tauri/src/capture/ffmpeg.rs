@@ -143,6 +143,19 @@ pub fn build_segment_command(config: &CaptureConfig, output_path: &Path) -> Comm
             // processes correctly.
             cmd.arg("-use_wallclock_as_timestamps").arg("1");
         }
+        if let Some(region) = config.monitor_region {
+            // Restricts the grab to one monitor. gdigrab interprets these in
+            // physical virtual-desktop pixels (verified on a mixed 125%/100%
+            // DPI dual-monitor setup), which is what `MonitorRegion` holds.
+            // Size is rounded down to even: libx264 + yuv420p rejects odd
+            // frame dimensions.
+            cmd.arg("-offset_x")
+                .arg(region.x.to_string())
+                .arg("-offset_y")
+                .arg(region.y.to_string())
+                .arg("-video_size")
+                .arg(format!("{}x{}", region.width & !1, region.height & !1));
+        }
         cmd.arg("-framerate")
             .arg(config.framerate.to_string())
             .arg("-i")
@@ -782,6 +795,46 @@ mod tests {
         assert!(!config.capture_system_audio);
         assert!(!config.webcam.enabled);
         assert!(config.capture_microphone, "microphone stays as the user set it");
+    }
+
+    /// Monitor selection: with no monitor chosen, the whole virtual desktop
+    /// (every monitor) is grabbed, exactly as before the feature existed.
+    #[test]
+    fn segment_command_without_monitor_grabs_whole_desktop() {
+        let config = CaptureConfig {
+            capture_microphone: false,
+            ..CaptureConfig::default()
+        };
+        let a = args(&build_segment_command(&config, Path::new("out.mp4")));
+
+        assert!(a.windows(2).any(|w| w == ["-i", "desktop"]), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-offset_x" || x == "-video_size"), "{a:?}");
+    }
+
+    /// Monitor selection: a chosen monitor crops gdigrab to exactly that
+    /// monitor's rectangle, including negative offsets (monitor left of the
+    /// primary) and odd sizes rounded down to even for yuv420p.
+    #[test]
+    fn segment_command_with_monitor_crops_to_that_monitor() {
+        let config = CaptureConfig {
+            monitor: Some(r"\\.\DISPLAY2".to_string()),
+            monitor_region: Some(super::super::config::MonitorRegion {
+                x: -1921,
+                y: 0,
+                width: 1921,
+                height: 1081,
+            }),
+            capture_microphone: false,
+            ..CaptureConfig::default()
+        };
+        let a = args(&build_segment_command(&config, Path::new("out.mp4")));
+
+        assert!(a.windows(2).any(|w| w == ["-offset_x", "-1921"]), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-offset_y", "0"]), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-video_size", "1920x1080"]), "{a:?}");
+        let offset_pos = a.iter().position(|x| x == "-offset_x").unwrap();
+        let input_pos = a.iter().position(|x| x == "desktop").unwrap();
+        assert!(offset_pos < input_pos, "crop options must precede -i: {a:?}");
     }
 
     /// F17 "not enabled" criterion: a plain config is left untouched.

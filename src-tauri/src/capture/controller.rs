@@ -474,6 +474,8 @@ mod tests {
             capture_video: true,
             webcam: WebcamOverlayConfig::default(),
             camera_only: CameraOnlyConfig::default(),
+            monitor: None,
+            monitor_region: None,
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
@@ -531,6 +533,8 @@ mod tests {
                 ..WebcamOverlayConfig::default()
             },
             camera_only: CameraOnlyConfig::default(),
+            monitor: None,
+            monitor_region: None,
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
@@ -567,6 +571,8 @@ mod tests {
             capture_video: false,
             webcam: WebcamOverlayConfig::default(),
             camera_only: CameraOnlyConfig::default(),
+            monitor: None,
+            monitor_region: None,
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
@@ -608,6 +614,8 @@ mod tests {
             capture_video: true,
             webcam: WebcamOverlayConfig::default(),
             camera_only: CameraOnlyConfig { enabled: true, device: None },
+            monitor: None,
+            monitor_region: None,
         }
     }
 
