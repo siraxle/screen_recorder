@@ -155,6 +155,7 @@ Translation is a separate job-queue task (`translating`), run after `transcribed
 - Hotkeys for start/stop/pause.
 - Private screen zones (masking a region, e.g., a password manager) — cut out of the video and not passed to STT/LLM.
 - Webcam picture-in-picture overlay: composite the front camera into a chosen corner of the recording, as a small circle or square.
+- Camera-only recording: record the front camera full-frame instead of the screen, in the camera's native mode, mirrored the way the user sees themselves, with the microphone as the only audio source.
 
 ### Nice-to-have (v2)
 - Automatic local/cloud LLM routing based on task complexity.
@@ -323,6 +324,31 @@ Core principle: **Capture → Transcribe → Summarize → Index** — an asynch
 - Given "Webcam overlay" is enabled but no camera is available on the machine
   When the user clicks "Start Recording"
   Then the app shows a clear error and does not start recording, matching how a missing microphone is handled.
+
+**F17. Camera-only recording**
+- Given the user enabled "Camera only (no screen)" and selected a camera before starting the recording
+  When they click "Start Recording"
+  Then the saved video is the camera feed full-frame, in the camera's native resolution and frame rate, mirrored horizontally (as the user sees themselves), with no screen capture in it.
+
+- Given "Camera only" is enabled and "Microphone" is enabled
+  When a recording is made
+  Then the saved video contains the microphone audio as its only audio track; system audio is not captured in this mode, even if it was selected before switching to camera-only.
+
+- Given "Camera only" is enabled and "Microphone" is disabled
+  When a recording is made
+  Then the saved video has a video stream and no audio stream.
+
+- Given "Camera only" is enabled
+  When the user pauses and resumes the recording
+  Then the saved video contains both fragments, exactly as for screen recording (F1).
+
+- Given "Camera only" is not enabled
+  When a recording is made
+  Then recording behaves exactly as before this feature existed (screen, audio-only, and webcam overlay modes are unaffected).
+
+- Given "Camera only" is enabled but no camera is available on the machine
+  When the user clicks "Start Recording"
+  Then the app shows a clear error and does not start recording, matching F16.
 
 ### Milestone 3 — v2 (weeks 10–15)
 

@@ -28,6 +28,13 @@ pub struct CaptureConfig {
     /// default so a plain screen recording is unaffected.
     #[serde(default)]
     pub webcam: WebcamOverlayConfig,
+    /// F17 camera-only recording: record the camera full-frame instead of
+    /// the desktop. A separate option from `capture_video` (which is about
+    /// the *screen*) and from `webcam` (an overlay *on* the screen) -- when
+    /// enabled it takes precedence over both, see
+    /// `CaptureConfig::normalized`.
+    #[serde(default)]
+    pub camera_only: CameraOnlyConfig,
 }
 
 fn default_capture_video() -> bool {
@@ -43,8 +50,37 @@ impl Default for CaptureConfig {
             framerate: 30,
             capture_video: true,
             webcam: WebcamOverlayConfig::default(),
+            camera_only: CameraOnlyConfig::default(),
         }
     }
+}
+
+impl CaptureConfig {
+    /// Resolves combinations that can't coexist, so the controller never has
+    /// to trust the caller to send a consistent config. F17: a camera-only
+    /// recording has no desktop video, no webcam overlay (there's no screen
+    /// to overlay onto), and records the microphone as its only audio
+    /// source -- system audio is deliberately not captured in this mode.
+    pub fn normalized(mut self) -> Self {
+        if self.camera_only.enabled {
+            self.capture_video = false;
+            self.capture_system_audio = false;
+            self.webcam.enabled = false;
+        }
+        self
+    }
+}
+
+/// F17: camera-only recording. `device: None` auto-resolves to the first
+/// camera `ffmpeg::list_cameras` finds, the same way `WebcamOverlayConfig`
+/// does. The camera is recorded in its native (dshow default) mode and
+/// mirrored horizontally, so the file looks the way the user sees
+/// themselves -- see `ffmpeg::build_camera_only_segment_command`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraOnlyConfig {
+    pub enabled: bool,
+    pub device: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

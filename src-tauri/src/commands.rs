@@ -66,7 +66,10 @@ pub async fn start_recording(
     let live_settings = db::with_db(&state.db, |conn| live_subtitles::load_settings(conn))
         .await
         .map_err(log_err)?;
-    let live_tap = if live_settings.enabled && settings.capture.capture_system_audio {
+    // Normalized first so F17 camera-only mode (which never captures system
+    // audio) can't start a live-subtitles pipeline with no audio to feed it.
+    let capture = settings.capture.normalized();
+    let live_tap = if live_settings.enabled && capture.capture_system_audio {
         let stt_device = db::with_db(&state.db, |conn| stt::load_settings(conn))
             .await
             .map_err(log_err)?
@@ -87,7 +90,7 @@ pub async fn start_recording(
 
     let recordings_dir = state.recordings_dir.lock().await.clone();
     let mut controller = CaptureController::new(
-        settings.capture,
+        capture,
         &recordings_dir,
         settings.language_override,
         live_tap,

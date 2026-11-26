@@ -45,6 +45,15 @@ interface CaptureConfig {
   framerate: number;
   captureVideo: boolean;
   webcam: WebcamOverlayConfig;
+  cameraOnly: CameraOnlyConfig;
+}
+
+// F17: record the camera full-frame instead of the screen. Microphone is the
+// only audio source in this mode; the backend ignores screen, overlay and
+// system audio when it's enabled (see CaptureConfig::normalized).
+interface CameraOnlyConfig {
+  enabled: boolean;
+  device: string | null;
 }
 
 const WEBCAM_CORNER_OPTIONS: Array<{ value: WebcamCorner; label: string }> = [
@@ -309,6 +318,8 @@ function App() {
   const [webcamDevice, setWebcamDevice] = useState<string>("");
   const [webcamShape, setWebcamShape] = useState<WebcamShape>("circle");
   const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("bottom_right");
+  const [cameraOnly, setCameraOnly] = useState(false);
+  const [cameraOnlyDevice, setCameraOnlyDevice] = useState<string>("");
   const [languageOverride, setLanguageOverride] = useState<string>("");
   const [customLanguage, setCustomLanguage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
@@ -366,7 +377,10 @@ function App() {
     invoke<string[]>("list_cameras")
       .then((devices) => {
         setCameras(devices);
-        if (devices.length > 0) setWebcamDevice(devices[0]);
+        if (devices.length > 0) {
+          setWebcamDevice(devices[0]);
+          setCameraOnlyDevice(devices[0]);
+        }
       })
       .catch((e) => setError(String(e)));
   }, []);
@@ -414,6 +428,14 @@ function App() {
     if (!captureVideo && webcamEnabled) setWebcamEnabled(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [captureVideo]);
+
+  // F17: camera-only mode replaces the screen and records the microphone as
+  // its only audio source, so screen video, the webcam overlay and system
+  // audio are all off while it's enabled (their checkboxes keep their own
+  // values for when the user switches back).
+  const screenVideo = captureVideo && !cameraOnly;
+  const systemAudio = captureSystemAudio && !cameraOnly;
+  const hasAnySource = screenVideo || cameraOnly || captureMicrophone || systemAudio;
 
   // Parakeet has no "Auto-detect"/"Other" entries (see PARAKEET_LANGUAGE_OPTIONS),
   // so switching engines away from Whisper while either is selected would
@@ -779,16 +801,20 @@ function App() {
     setLiveSubtitlesCooldown(false);
     recordingIdRef.current = null;
     const config: CaptureConfig = {
-      captureSystemAudio,
+      captureSystemAudio: systemAudio,
       captureMicrophone,
       microphoneDevice: captureMicrophone && microphoneDevice ? microphoneDevice : null,
       framerate: 30,
-      captureVideo,
+      captureVideo: screenVideo,
       webcam: {
-        enabled: captureVideo && webcamEnabled,
-        device: captureVideo && webcamEnabled && webcamDevice ? webcamDevice : null,
+        enabled: screenVideo && webcamEnabled,
+        device: screenVideo && webcamEnabled && webcamDevice ? webcamDevice : null,
         shape: webcamShape,
         corner: webcamCorner,
+      },
+      cameraOnly: {
+        enabled: cameraOnly,
+        device: cameraOnly && cameraOnlyDevice ? cameraOnlyDevice : null,
       },
     };
     await run(() =>
@@ -1233,15 +1259,45 @@ function App() {
           <input
             type="checkbox"
             checked={captureVideo}
-            disabled={status !== "stopped"}
+            disabled={status !== "stopped" || cameraOnly}
             onChange={(e) => setCaptureVideo(e.currentTarget.checked)}
           />
           Record video
         </label>
-        {!captureVideo && (
+        {!captureVideo && !cameraOnly && (
           <p className="output">
             Audio-only recording — only the audio sources selected below will be captured.
           </p>
+        )}
+
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={cameraOnly}
+            disabled={status !== "stopped"}
+            onChange={(e) => setCameraOnly(e.currentTarget.checked)}
+          />
+          Camera only (no screen)
+        </label>
+        {cameraOnly && (
+          <>
+            <select
+              value={cameraOnlyDevice}
+              disabled={status !== "stopped"}
+              onChange={(e) => setCameraOnlyDevice(e.currentTarget.value)}
+            >
+              {cameras.length === 0 && <option value="">No camera found</option>}
+              {cameras.map((device) => (
+                <option key={device} value={device}>
+                  {device}
+                </option>
+              ))}
+            </select>
+            <p className="output">
+              Records the camera instead of the screen, mirrored as you see yourself. Audio comes
+              from the microphone only — system audio is not recorded in this mode.
+            </p>
+          </>
         )}
 
         <label className="checkbox-row">
@@ -1271,14 +1327,14 @@ function App() {
         <label className="checkbox-row">
           <input
             type="checkbox"
-            checked={captureSystemAudio}
-            disabled={status !== "stopped"}
+            checked={systemAudio}
+            disabled={status !== "stopped" || cameraOnly}
             onChange={(e) => setCaptureSystemAudio(e.currentTarget.checked)}
           />
           System audio (WASAPI loopback)
         </label>
 
-        {captureVideo && (
+        {screenVideo && (
         <label className="checkbox-row">
           <input
             type="checkbox"
@@ -1289,7 +1345,7 @@ function App() {
           Webcam overlay
         </label>
         )}
-        {captureVideo && webcamEnabled && (
+        {screenVideo && webcamEnabled && (
           <>
             <select
               value={webcamDevice}
@@ -1335,12 +1391,12 @@ function App() {
           <input
             type="checkbox"
             checked={liveSubtitlesEnabled}
-            disabled={status !== "stopped" || !captureSystemAudio}
+            disabled={status !== "stopped" || !systemAudio}
             onChange={(e) => handleSaveLiveSubtitlesSettings(e.currentTarget.checked)}
           />
           Live subtitles (experimental preview during recording, Windows + system audio only)
         </label>
-        {liveSubtitlesEnabled && !captureSystemAudio && (
+        {liveSubtitlesEnabled && !systemAudio && (
           <p className="output">
             Live subtitles need "System audio" enabled above — they won't run this
             session until it is.
@@ -1378,7 +1434,7 @@ function App() {
             onChange={(e) => setCustomLanguage(e.currentTarget.value)}
           />
         )}
-        {!captureVideo && !captureMicrophone && !captureSystemAudio && (
+        {!hasAnySource && (
           <p className="output">Select at least one video or audio source to start recording.</p>
         )}
       </section>
@@ -1386,7 +1442,7 @@ function App() {
       <section className="controls">
         {status === "stopped" && (
           <button
-            disabled={busy || (!captureVideo && !captureMicrophone && !captureSystemAudio)}
+            disabled={busy || !hasAnySource}
             onClick={handleStart}
           >
             Start Recording
@@ -1417,7 +1473,7 @@ function App() {
         </button>
       </section>
 
-      {status === "recording" && liveSubtitlesEnabled && captureSystemAudio && (
+      {status === "recording" && liveSubtitlesEnabled && systemAudio && (
         <section className="live-caption-area">
           {liveCaption && <p className="live-caption">{liveCaption}</p>}
           {liveSubtitlesCooldown && (

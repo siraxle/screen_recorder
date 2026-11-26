@@ -81,7 +81,7 @@ impl CaptureController {
         std::fs::create_dir_all(&work_dir)
             .with_context(|| format!("failed to create working dir {work_dir:?}"))?;
         Ok(Self {
-            config,
+            config: config.normalized(),
             work_dir,
             segment_index: 0,
             finalized_segments: Vec::new(),
@@ -161,7 +161,9 @@ impl CaptureController {
     async fn begin_segment(&mut self) -> Result<()> {
         self.segment_index += 1;
 
+        let camera_only = self.config.camera_only.enabled;
         if !self.config.capture_video
+            && !camera_only
             && !self.config.capture_microphone
             && !self.config.capture_system_audio
         {
@@ -196,16 +198,39 @@ impl CaptureController {
             })?);
         }
 
-        // No ffmpeg process is needed here at all when neither desktop video
-        // nor the microphone is being captured -- an audio-only recording
-        // with just system audio relies solely on `loopback` below.
-        let has_primary = self.config.capture_video || self.config.capture_microphone;
+        // F17: same auto-resolve for camera-only recording. A missing camera
+        // fails here, before any process is spawned, so the recording never
+        // starts (matching how a missing microphone is handled above).
+        if camera_only && self.config.camera_only.device.is_none() {
+            let cameras = ffmpeg::list_cameras()
+                .await
+                .context("failed to enumerate cameras")?;
+            self.config.camera_only.device = Some(cameras.into_iter().next().ok_or_else(|| {
+                anyhow!("camera-only recording is enabled but no camera device was found")
+            })?);
+        }
+
+        // No ffmpeg process is needed here at all when neither desktop video,
+        // the camera, nor the microphone is being captured -- an audio-only
+        // recording with just system audio relies solely on `loopback` below.
+        let has_primary =
+            self.config.capture_video || camera_only || self.config.capture_microphone;
         let (primary_child, primary_path, primary_stderr) = if has_primary {
-            let label = if self.config.capture_video { "video" } else { "audio" };
+            let label = if camera_only {
+                "camera"
+            } else if self.config.capture_video {
+                "video"
+            } else {
+                "audio"
+            };
             let primary_path = self
                 .work_dir
                 .join(format!("segment-{:03}-{label}.mp4", self.segment_index));
-            let mut cmd = ffmpeg::build_segment_command(&self.config, &primary_path);
+            let mut cmd = if camera_only {
+                ffmpeg::build_camera_only_segment_command(&self.config, &primary_path)
+            } else {
+                ffmpeg::build_segment_command(&self.config, &primary_path)
+            };
             let mut child = cmd
                 .spawn()
                 .context("failed to spawn ffmpeg for video/mic capture")?;
@@ -422,8 +447,13 @@ impl CaptureController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::config::WebcamOverlayConfig;
+    use super::super::config::{CameraOnlyConfig, WebcamOverlayConfig};
     use std::time::Duration;
+
+    /// A dshow camera can only be opened by one process at a time, so tests
+    /// that open the real camera (F16 overlay, F17 camera-only) must not run
+    /// in parallel under the default multi-threaded `cargo test`.
+    static CAMERA_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Exercises the real pipeline end-to-end (spawns actual ffmpeg + a real
     /// WASAPI loopback capture) rather than mocking it, since the whole
@@ -443,6 +473,7 @@ mod tests {
             framerate: 10,
             capture_video: true,
             webcam: WebcamOverlayConfig::default(),
+            camera_only: CameraOnlyConfig::default(),
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
@@ -477,6 +508,7 @@ mod tests {
     /// mic device).
     #[tokio::test]
     async fn records_with_webcam_overlay_when_camera_present() {
+        let _camera = CAMERA_LOCK.lock().await;
         let cameras = ffmpeg::list_cameras().await.expect("list_cameras should not error");
         let Some(device) = cameras.into_iter().next() else {
             eprintln!("skipping records_with_webcam_overlay_when_camera_present: no camera found");
@@ -498,6 +530,7 @@ mod tests {
                 device: Some(device),
                 ..WebcamOverlayConfig::default()
             },
+            camera_only: CameraOnlyConfig::default(),
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
@@ -533,6 +566,7 @@ mod tests {
             framerate: 10,
             capture_video: false,
             webcam: WebcamOverlayConfig::default(),
+            camera_only: CameraOnlyConfig::default(),
         };
         let mut controller = CaptureController::new(config, &base_dir, None, None).unwrap();
 
@@ -548,5 +582,107 @@ mod tests {
         assert!(result.exists(), "output file must exist");
         let size = std::fs::metadata(&result).unwrap().len();
         assert!(size > 1000, "output file is suspiciously small: {size} bytes");
+    }
+    /// Stream types (`video`/`audio`) of a finished file, via ffprobe.
+    async fn stream_types(path: &Path) -> Vec<String> {
+        let output = crate::procutil::command(crate::setup::paths::ffprobe_program())
+            .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .await
+            .expect("ffprobe should run");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn camera_only_config(mic: Option<String>) -> CaptureConfig {
+        CaptureConfig {
+            // Deliberately requested -- F17 must ignore system audio.
+            capture_system_audio: true,
+            capture_microphone: mic.is_some(),
+            microphone_device: mic,
+            framerate: 30,
+            capture_video: true,
+            webcam: WebcamOverlayConfig::default(),
+            camera_only: CameraOnlyConfig { enabled: true, device: None },
+        }
+    }
+
+    /// F17: camera-only recording with no microphone produces a video-only
+    /// file -- system audio is not captured even though it was requested,
+    /// and pause/resume still concatenates segments. Real camera, no mocks;
+    /// skips (not fails) when this machine has no camera, like the F16 test.
+    #[tokio::test]
+    async fn records_camera_only_without_screen_or_system_audio() {
+        let _camera = CAMERA_LOCK.lock().await;
+        if ffmpeg::list_cameras().await.expect("list_cameras").is_empty() {
+            eprintln!("skipping records_camera_only_without_screen_or_system_audio: no camera found");
+            return;
+        }
+        let base_dir = std::env::temp_dir().join("screen_recorder_camera_only_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let mut controller =
+            CaptureController::new(camera_only_config(None), &base_dir, None, None).unwrap();
+        controller.start().await.expect("start should succeed");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        controller.pause().await.expect("pause should succeed");
+        controller.resume().await.expect("resume should succeed");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let output_path = base_dir.join("output.mp4");
+        let result = controller.stop(&output_path).await.expect("stop should succeed");
+        assert!(std::fs::metadata(&result).unwrap().len() > 1000);
+        assert_eq!(stream_types(&result).await, vec!["video".to_string()]);
+    }
+
+    /// F17 with the microphone: one video + one audio stream (camera and
+    /// mic captured together). Skips when there's no camera or no mic.
+    #[tokio::test]
+    async fn records_camera_only_with_microphone() {
+        let _camera = CAMERA_LOCK.lock().await;
+        if ffmpeg::list_cameras().await.expect("list_cameras").is_empty() {
+            eprintln!("skipping records_camera_only_with_microphone: no camera found");
+            return;
+        }
+        let Some(mic) = ffmpeg::list_microphones().await.expect("list_microphones").into_iter().next()
+        else {
+            eprintln!("skipping records_camera_only_with_microphone: no microphone found");
+            return;
+        };
+        let base_dir = std::env::temp_dir().join("screen_recorder_camera_only_mic_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let mut controller =
+            CaptureController::new(camera_only_config(Some(mic)), &base_dir, None, None).unwrap();
+        controller.start().await.expect("start should succeed");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let output_path = base_dir.join("output.mp4");
+        let result = controller.stop(&output_path).await.expect("stop should succeed");
+        let mut types = stream_types(&result).await;
+        types.sort();
+        assert_eq!(types, vec!["audio".to_string(), "video".to_string()]);
+    }
+
+    /// F17 "no camera" criterion: start fails with a clear error and no
+    /// recording begins. Only observable on a machine with no camera.
+    #[tokio::test]
+    async fn camera_only_without_camera_refuses_to_start() {
+        if !ffmpeg::list_cameras().await.expect("list_cameras").is_empty() {
+            eprintln!("skipping camera_only_without_camera_refuses_to_start: a camera is present");
+            return;
+        }
+        let base_dir = std::env::temp_dir().join("screen_recorder_camera_only_nocam_test");
+        let mut controller =
+            CaptureController::new(camera_only_config(None), &base_dir, None, None).unwrap();
+        let err = controller.start().await.expect_err("start must fail without a camera");
+        assert!(err.to_string().contains("no camera device was found"), "{err}");
+        assert_eq!(controller.status(), RecordingStatus::Stopped);
     }
 }
