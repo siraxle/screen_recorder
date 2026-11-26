@@ -667,6 +667,50 @@ pub fn set_recording_title(
     Ok(())
 }
 
+/// Points the recording at its renamed on-disk files (see
+/// `recording_files::rename_recording_files`).
+pub fn set_recording_paths(
+    conn: &Connection,
+    recording_id: &str,
+    video_path: &Path,
+    compressed_path: Option<&Path>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recordings SET video_path = ?1, compressed_path = ?2 WHERE id = ?3",
+        rusqlite::params![
+            video_path.to_string_lossy(),
+            compressed_path.map(|p| p.to_string_lossy().to_string()),
+            recording_id
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_recording_compressed_path(conn: &Connection, recording_id: &str) -> Result<Option<PathBuf>> {
+    let path: Option<String> = conn
+        .query_row(
+            "SELECT compressed_path FROM recordings WHERE id = ?1",
+            [recording_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("recording {recording_id} not found"))?;
+    Ok(path.map(PathBuf::from))
+}
+
+/// True while a `transcribe` job is queued or running: it reads the video
+/// (and writes `<stem>.stt.wav` next to it), so its files must not move.
+pub fn has_active_transcribe_job(conn: &Connection, recording_id: &str) -> Result<bool> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM jobs WHERE recording_id = ?1 AND stage = 'transcribe' \
+             AND status IN ('pending', 'running') LIMIT 1",
+            [recording_id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 /// Deletes a recording and everything derived from it (transcript,
 /// translations, summary, jobs). Returns the recording's `video_path` so the
 /// caller can also remove the on-disk recording folder — each recording

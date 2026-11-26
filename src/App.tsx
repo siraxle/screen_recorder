@@ -948,11 +948,14 @@ function App() {
     setRenaming(true);
     setError(null);
     try {
-      await invoke("rename_recording", { recordingId: recording.id, title: nextTitle });
-      setRecordings((prev) =>
-        prev.map((r) => (r.id === recording.id ? { ...r, title: nextTitle } : r))
-      );
-      setPipeline((prev) => (prev && prev.id === recording.id ? { ...prev, title: nextTitle } : prev));
+      // The backend also renames the folder/files on disk, so take its
+      // updated summary (new videoPath/compressedPath), not just the title.
+      const updated = await invoke<RecordingSummary>("rename_recording", {
+        recordingId: recording.id,
+        title: nextTitle,
+      });
+      setRecordings((prev) => prev.map((r) => (r.id === recording.id ? updated : r)));
+      setPipeline((prev) => (prev && prev.id === recording.id ? updated : prev));
       setEditingTitleId(null);
       setEditingTitle("");
     } catch (e) {

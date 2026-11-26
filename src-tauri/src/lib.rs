@@ -8,6 +8,7 @@ mod llm;
 mod logging;
 mod overlay;
 mod pipeline;
+mod recording_files;
 mod portable;
 mod procutil;
 mod settings_window;
